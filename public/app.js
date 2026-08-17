@@ -44,7 +44,6 @@
   var times = document.getElementById('times');
   var bodySun = document.getElementById('body-sun');
   var bodyMoon = document.getElementById('body-moon');
-  var glowSun = document.getElementById('glow-sun');
   var moonLitPath = document.getElementById('moonLitPath');
   var moonLitClipPath = document.getElementById('moonLitClipPath');
   var moonLitGroup = document.getElementById('moonLitGroup');
@@ -238,7 +237,6 @@
 
     setHidden(bodySun, !sun.visible);
     setHidden(bodyMoon, !moon.visible);
-    setHidden(glowSun, sun.offscreen !== null);
 
     /* The Moon's phase: illuminated fraction gives the terminator, the bright-limb angle
        gives the tilt. Contract v3: the angle runs from the zenith towards INCREASING

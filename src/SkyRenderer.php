@@ -300,8 +300,10 @@ final class SkyRenderer
      */
     public function glow(): string
     {
-        return '<div class="glow glow--sun" id="glow-sun" aria-hidden="true"'
-            . self::hiddenIf($this->sunScreen['offscreen'] !== null) . '></div>';
+        // Never hidden. Even with the Sun below the horizon or just past the edge of the
+        // panorama the glow stays at its azimuth (clamped to the edge) - that continuity
+        // is what makes twilight read as twilight instead of popping off at 270 degrees.
+        return '<div class="glow glow--sun" id="glow-sun" aria-hidden="true"></div>';
     }
 
     /**
