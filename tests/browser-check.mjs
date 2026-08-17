@@ -483,6 +483,37 @@ for (const path of paths) {
   }
 }
 
+/* --------------------------- the longer message: three failures in a row (spec 7.3/b) */
+
+section('3b. After the third failure the message doubles in length — and must still cover nothing');
+
+for (const viewport of [viewports[0], viewports[3]]) {
+  phase = `long/${viewport.name}`;
+  await setViewport(viewport.w, viewport.h);
+  await blockApi();
+  await navigate(`${BASE}/?t=2026-06-21T12:30`);
+  /* Three consecutive failures switch the text to "Az égbolt 3 perce nem frissült…", which is
+     twice as long - the case most likely to wrap into the compass labels. */
+  for (let i = 0; i < 3; i++) {
+    await triggerRefresh();
+    await sleep(700);
+  }
+  await sleep(700);
+
+  const m = await measureChip();
+  ok(`${viewport.name}: the third-failure text is the longer one`,
+    /3 perce/.test(m.text), `"${m.text}"`);
+  ok(`${viewport.name}: the longer message is still at most 2 lines`, m.lines <= 2,
+    `${m.lines} line box(es), chip ${m.chip.w}x${m.chip.h}px`);
+  const coveredLong = m.labels.filter((l) => overlaps(m.chip, l.box)).map((l) => l.text);
+  ok(`${viewport.name}: the longer message covers no compass label`, coveredLong.length === 0,
+    coveredLong.length ? `covered: ${coveredLong.join(' ')}` : `clear (chip above the horizon: ${m.aboveHorizon})`);
+  ok(`${viewport.name}: the longer message does not overlap the .info strip`, !overlaps(m.chip, m.info),
+    `chip bottom=${m.chip.bottom.toFixed(1)} info top=${m.info.top.toFixed(1)}`);
+
+  await unblockApi();
+}
+
 /* ------------------------------------------- the 8 s fade, once per failure path (S3-1) */
 
 section('4. The chip fades after 8 s, the button stays (spec 7.3/b, S3-1)');
