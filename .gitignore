@@ -1,0 +1,22 @@
+# Secrets — never committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies / build output
+/vendor/
+/node_modules/
+/public/build/
+
+# Logs and runtime junk
+*.log
+/logs/
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
