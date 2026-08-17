@@ -684,6 +684,258 @@ foreach ($cssRules($smallCapsFixture) as [$selectorList, $declarations]) {
 ok('self-check: the detector catches small-caps too', $smallCapsCaught, 'spec 6.6 forbids it as well');
 
 // ---------------------------------------------------------------------------
+section('9. Stylesheet rules the browser will not forgive (BUG-0013, BUG-0014)');
+// ---------------------------------------------------------------------------
+
+/**
+ * What this section can and cannot do.
+ *
+ * It CANNOT prove that `prefers-contrast: more` makes the plate darker. Only a browser can:
+ * the cascade, the media query and the custom-property cycle all live in the engine, and
+ * BUG-0013 is the proof - the block WAS in the stylesheet, section 7 asserted its presence,
+ * and the visitor still got a LIGHTER plate. That measurement is tests/browser-check.mjs
+ * (matchMedia + getComputedStyle, against the deployed URL).
+ *
+ * What it CAN do is catch the two shapes of mistake that produced the bugs, cheaply, on every
+ * run, without a browser:
+ *  - a custom property declared in terms of itself (a cycle: the declaration is dropped at
+ *    computed-value time and the property silently falls back to the inherited value),
+ *  - the arithmetic behind spec 10.3: what contrast a given plate alpha actually yields,
+ *  - and the two positioning/animation mistakes that made the error chip cover the compass.
+ */
+
+/** Every `--x: ... var(--x) ...` in the stylesheet - i.e. a custom property defined by itself. */
+$selfReferentialCustomProps = static function (string $css) use ($cssRules): array {
+    $found = [];
+    foreach ($cssRules($css) as [$selectorList, $declarations]) {
+        preg_match_all('/(?:^|;)\s*(--[\w-]+)\s*:\s*([^;}]+)/', $declarations, $m, PREG_SET_ORDER);
+        foreach ($m as $declaration) {
+            $name = $declaration[1];
+            $value = $declaration[2];
+            if (preg_match('/var\(\s*' . preg_quote($name, '/') . '(?![\w-])/', $value) === 1) {
+                $found[] = trim($selectorList) . ' { ' . $name . ': ' . trim($value) . ' }';
+            }
+        }
+    }
+
+    return $found;
+};
+
+$customPropDeclarationCount = 0;
+foreach ($cssRules($css) as [, $declarations]) {
+    $customPropDeclarationCount += preg_match_all('/(?:^|;)\s*--[\w-]+\s*:/', $declarations);
+}
+ok(
+    'the stylesheet actually declares custom properties',
+    $customPropDeclarationCount >= 20,
+    $customPropDeclarationCount . ' declaration(s) seen — if this were 0 the check below would be vacuous'
+);
+
+$cycles = $selfReferentialCustomProps($css);
+ok(
+    'no custom property is declared in terms of itself (BUG-0013)',
+    $cycles === [],
+    $cycles === []
+        ? 'no calc(var(--x) + …) inside --x'
+        : 'cycle(s): ' . implode(' | ', $cycles)
+);
+
+/** Self-check: the detector must reject the three shapes this bug can take, and accept the fix. */
+$cycleFixtures = [
+    'the original BUG-0013 declaration' =>
+        ['.hello { --plate-alpha: calc(var(--plate-alpha) + .18); }', true],
+    'a cycle hidden inside a media query' =>
+        ['@media (prefers-contrast: more) { .hello { --plate-alpha: calc(var(--plate-alpha) + .18); } }', true],
+    'a cycle written with loose whitespace' =>
+        ['.hello { --plate-alpha: calc( var( --plate-alpha ) + .18 ); }', true],
+    'the fix itself (must NOT be flagged)' =>
+        ['.hello { --plate-alpha-eff: min(1, calc(var(--plate-alpha) + var(--plate-boost))); }', false],
+];
+foreach ($cycleFixtures as $what => [$fixture, $shouldFlag]) {
+    $flagged = $selfReferentialCustomProps($fixture) !== [];
+    ok(
+        'self-check: the cycle detector handles ' . $what,
+        $flagged === $shouldFlag,
+        'flagged=' . var_export($flagged, true) . ' expected=' . var_export($shouldFlag, true)
+    );
+}
+
+/**
+ * Spec 10.3's own arithmetic: white text on a plate of `rgb(5 10 22 / alpha)` over a backdrop.
+ * The backdrop-filter's darkening is deliberately NOT counted (as in the spec's table), so the
+ * number is the pessimistic one.
+ */
+$contrastOverBackdrop = static function (float $alpha, array $backdrop): float {
+    $plate = [5, 10, 22];
+    $luminance = static function (array $rgb): float {
+        $channel = static function (float $value): float {
+            $v = $value / 255;
+
+            return $v <= 0.04045 ? $v / 12.92 : (($v + 0.055) / 1.055) ** 2.4;
+        };
+
+        return 0.2126 * $channel($rgb[0]) + 0.7152 * $channel($rgb[1]) + 0.0722 * $channel($rgb[2]);
+    };
+
+    $composite = [];
+    foreach ([0, 1, 2] as $i) {
+        $composite[$i] = $alpha * $plate[$i] + (1 - $alpha) * $backdrop[$i];
+    }
+
+    return 1.05 / ($luminance($composite) + 0.05);
+};
+
+/** The worst case of the whole design: the Sun's near-white corona right behind the headline. */
+$corona = [255, 248, 224];
+
+// The tokens the cascade is built from, read from the stylesheet rather than retyped here.
+$conflictAlpha = (float) $declaredValue($rootDeclarations, '--conflict-alpha');
+ok(
+    '--conflict-alpha is the spec 8.4 value',
+    abs($conflictAlpha - 0.62) < 1e-9,
+    '--conflict-alpha=' . var_export($declaredValue($rootDeclarations, '--conflict-alpha'), true)
+);
+
+/** The surcharge declared inside the prefers-contrast block, whatever property carries it. */
+$contrastBoost = null;
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    if (str_contains($selectorList, 'prefers-contrast') && str_contains($selectorList, '.hello')) {
+        $contrastBoost = $declaredValue($declarations, '--plate-boost') ?? $contrastBoost;
+    }
+}
+ok(
+    'the prefers-contrast block raises the plate by the spec 10.3 surcharge (+.18)',
+    $contrastBoost !== null && abs((float) $contrastBoost - 0.18) < 1e-9,
+    '--plate-boost=' . var_export($contrastBoost, true)
+);
+$helloRule = '';
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    if (trim($selectorList) === '.hello') {
+        $helloRule .= ';' . $declarations;
+    }
+}
+ok(
+    'the plate is painted from the effective alpha, not from the raw one',
+    str_contains((string) $declaredValue($helloRule, 'background'), 'var(--plate-alpha-eff)'),
+    'background=' . var_export($declaredValue($helloRule, 'background'), true)
+);
+
+$alphaWithContrast = min(1.0, $conflictAlpha + (float) $contrastBoost);
+near('the high-contrast collision alpha is the spec 10.3 value', $alphaWithContrast, 0.80, 1e-9);
+ok(
+    'white on that plate clears AA over the Sun\'s corona (spec 10.3, worst case)',
+    $contrastOverBackdrop($alphaWithContrast, $corona) >= 4.5,
+    sprintf('alpha=%.2f -> %.2f : 1 (AA needs 4.5)', $alphaWithContrast, $contrastOverBackdrop($alphaWithContrast, $corona))
+);
+ok(
+    'the same maths still passes the plain collision case (0.62, no preference)',
+    $contrastOverBackdrop(0.62, $corona) >= 4.5,
+    sprintf('%.2f : 1 — the spec\'s table says 5.92', $contrastOverBackdrop(0.62, $corona))
+);
+ok(
+    'self-check: the maths does fail the broken 0.42 that BUG-0013 produced',
+    $contrastOverBackdrop(0.42, $corona) < 4.5,
+    sprintf('%.2f : 1 — this is what the high-contrast user was getting', $contrastOverBackdrop(0.42, $corona))
+);
+
+/** ------------------------------------------------------------ the error chip (BUG-0014) */
+
+$chipRule = '';
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    if (trim($selectorList) === '.errorchip') {
+        $chipRule .= ';' . $declarations;
+    }
+}
+ok('the stylesheet actually has a rule for .errorchip', $chipRule !== '', 'without it the checks below are vacuous');
+
+/**
+ * An entry animation that fills forwards keeps `opacity: 1` with animation-origin priority,
+ * which outranks every normal declaration - including .errorchip--faded. That is why the chip
+ * stayed fully opaque for eight minutes instead of fading after eight seconds (S3-1).
+ */
+$animationFillsForward = static function (?string $animation): bool {
+    if ($animation === null) {
+        return false;
+    }
+
+    return preg_match('/(?<![\w-])(forwards|both)(?![\w-])/', $animation) === 1;
+};
+ok(
+    'the chip\'s entry animation does not fill forwards (S3-1)',
+    !$animationFillsForward($declaredValue($chipRule, 'animation')),
+    'animation=' . var_export($declaredValue($chipRule, 'animation'), true)
+        . ' — a forwards/both fill would freeze opacity: 1 and defeat .errorchip--faded'
+);
+ok(
+    'self-check: the fill detector catches the old declaration',
+    $animationFillsForward('chip-in var(--dur-chip-in) var(--ease-out) both')
+        && $animationFillsForward('chip-in 240ms ease forwards')
+        && !$animationFillsForward('chip-in 240ms ease'),
+    'both/forwards flagged, plain animation not'
+);
+$fadedRule = '';
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    if (str_contains($selectorList, '.errorchip--faded')) {
+        $fadedRule .= ';' . $declarations;
+    }
+}
+$fadedOpacity = $declaredValue($fadedRule, 'opacity');
+ok(
+    'the fade class is still there and still dims the chip',
+    $fadedOpacity !== null && (float) $fadedOpacity < 1.0,
+    'opacity=' . var_export($fadedOpacity, true) . ' — spec 7.3/b: the message fades, the button stays'
+);
+
+/**
+ * An absolutely positioned box is shrink-to-fit. With `left: 50%` and no `right`, the width
+ * available to it is only half the viewport - which is what broke the message into five lines
+ * inside a 205px box at 375px (S2-2). Anchoring both edges gives it the whole width.
+ */
+$halfWidthTrap = static function (string $rule) use ($declaredValue): bool {
+    $left = $declaredValue($rule, 'left');
+    $right = $declaredValue($rule, 'right');
+
+    return $left !== null && str_contains($left, '50%') && $right === null;
+};
+ok(
+    'the chip is not squeezed into half the viewport (S2-2)',
+    !$halfWidthTrap($chipRule),
+    'left=' . var_export($declaredValue($chipRule, 'left'), true)
+        . ' right=' . var_export($declaredValue($chipRule, 'right'), true)
+);
+ok(
+    'self-check: the half-width detector catches the old declaration',
+    $halfWidthTrap('left: 50%; transform: translateX(-50%);') && !$halfWidthTrap('left: 0; right: 0; margin-inline: auto;'),
+    'old rule flagged, new rule not'
+);
+
+/**
+ * The chip clears the .info strip by the strip's MEASURED height, not by a constant. The
+ * stylesheet reads --info-h; app.js is the only thing that can write it. Neither half is worth
+ * anything alone, so both are asserted here - the lesson of BUG-0011, applied across files.
+ */
+ok(
+    'the chip clears the info strip by its measured height (S3-5)',
+    str_contains((string) $declaredValue($chipRule, 'bottom'), 'var(--info-h'),
+    'bottom=' . var_export($declaredValue($chipRule, 'bottom'), true)
+);
+ok(
+    'the script measures the info strip and publishes --info-h',
+    str_contains($js, "setProperty('--info-h'") && str_contains($js, 'getBoundingClientRect'),
+    'without the writer the CSS fallback would silently take over'
+);
+ok(
+    'the measurement is refreshed on resize and orientation change',
+    str_contains($js, 'onViewportChange') && str_contains($js, 'measureInfoStrip'),
+    'spec 8.2: the strip is a 2x2 grid on a phone and one row above 768px'
+);
+ok(
+    'the chip is still shown for both failure paths and the 8s fade is still armed',
+    str_contains($js, 'CHIP_FADE_AFTER = 8000') && str_contains($js, "chip.classList.add('errorchip--faded')"),
+    'spec 7.3/b'
+);
+
+// ---------------------------------------------------------------------------
 echo "\n" . str_repeat('=', 78) . "\n";
 printf("TOTAL: %d passed, %d failed\n", RenderResult::$passed, RenderResult::$failed);
 

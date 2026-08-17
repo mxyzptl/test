@@ -42,6 +42,7 @@
   var infoNoteMain = document.getElementById('info-note-main');
   var infoNoteSub = document.getElementById('info-note-sub');
   var times = document.getElementById('times');
+  var infoStrip = document.querySelector('.info');
   var bodySun = document.getElementById('body-sun');
   var bodyMoon = document.getElementById('body-moon');
   var moonLitPath = document.getElementById('moonLitPath');
@@ -405,6 +406,25 @@
 
   /* ------------------------------------------------------------- error states */
 
+  /* How tall the .info strip actually is, in px, published to the stylesheet as --info-h.
+     The error chip is positioned above it (spec 7.3/b: "az .info sav fole csuszik"), and the
+     strip's height is not a constant: it is a 2x2 grid on a phone, one row on a tablet, and it
+     grows again when the empty-state note replaces the times. The chip used to clear a
+     hard-coded 44px, which is why it sat on top of the compass labels and the info text
+     (BUG-0014). Measuring is cheap - it happens on failure and on a debounced resize, never in
+     the refresh loop - and .info's own height does not depend on the chip, so there is no
+     layout feedback loop here. */
+  function measureInfoStrip() {
+    if (!infoStrip) {
+      return;
+    }
+
+    var height = Math.round(infoStrip.getBoundingClientRect().height);
+    if (height > 0) {
+      stage.style.setProperty('--info-h', height + 'px');
+    }
+  }
+
   function ensureErrorChip() {
     if (errorChip) {
       return errorChip;
@@ -438,6 +458,9 @@
   }
 
   function showErrorChip() {
+    /* Measure first: the chip's `bottom` is read on the very frame it is inserted. */
+    measureInfoStrip();
+
     var chip = ensureErrorChip();
 
     chip.__text.textContent = failures >= 3
@@ -563,16 +586,18 @@
     refresh(false);
   });
 
-  window.addEventListener('resize', function () {
+  function onViewportChange() {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(checkCollision, RESIZE_DEBOUNCE);
-  });
+    resizeTimer = window.setTimeout(function () {
+      checkCollision();
+      measureInfoStrip();
+    }, RESIZE_DEBOUNCE);
+  }
 
-  window.addEventListener('orientationchange', function () {
-    window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(checkCollision, RESIZE_DEBOUNCE);
-  });
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('orientationchange', onViewportChange);
 
   scheduleCollisionCheck();
+  requestAnimationFrame(measureInfoStrip);
   schedule(REFRESH_INTERVAL);
 })();
