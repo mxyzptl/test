@@ -460,7 +460,11 @@ final class SkyRenderer
         foreach ([['sun', $this->sunScreen], ['moon', $this->moonScreen]] as [$name, $screen]) {
             // A marker only makes sense for a body that is below the horizon but still
             // somewhere on the panorama; outside 90-270 degrees the edge chip speaks instead.
-            $hidden = self::hiddenIf($screen['visible'] || $screen['offscreen'] !== null);
+            // In the error state there is no position to mark - saying nothing beats
+            // pointing confidently at a made-up azimuth.
+            $hidden = self::hiddenIf(
+                $this->state === 'error' || $screen['visible'] || $screen['offscreen'] !== null
+            );
             $deep = $screen['depth'] > 12.0 ? ' submarker--deep' : '';
 
             $out .= '<i class="subline subline--' . $name . '" id="subline-' . $name . '"' . $hidden . '></i>'
@@ -480,7 +484,8 @@ final class SkyRenderer
     {
         $bands = '';
         foreach (['left', 'right'] as $side) {
-            $onSide = $this->sunScreen['offscreen'] === $side || $this->moonScreen['offscreen'] === $side;
+            $onSide = $this->state !== 'error'
+                && ($this->sunScreen['offscreen'] === $side || $this->moonScreen['offscreen'] === $side);
             $bands .= '<i class="edgeband edgeband--' . $side . '" id="edgeband-' . $side . '"'
                 . self::hiddenIf(!$onSide) . '></i>';
         }
@@ -490,7 +495,7 @@ final class SkyRenderer
             $side = $screen['offscreen'] ?? 'left';
 
             $chips .= '<div class="edgechip edgechip--' . $side . '" id="edgechip-' . $key . '"'
-                . self::hiddenIf($screen['offscreen'] === null) . '>'
+                . self::hiddenIf($this->state === 'error' || $screen['offscreen'] === null) . '>'
                 . htmlspecialchars(
                     $label . ': É-i sáv · ' . self::degrees($screen['azimuth']) . '°',
                     ENT_QUOTES | ENT_SUBSTITUTE,

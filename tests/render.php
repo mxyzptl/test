@@ -386,6 +386,10 @@ ok('the error state exists', $error->state() === 'error', 'state=' . $error->sta
 ok('the error state falls back to a night sky', $error->phase() === 'night', 'phase=' . $error->phase());
 ok('the error state names the way out', str_contains($error->info(), 'Frissítsd az oldalt pár perc múlva.'), '');
 ok('the error state draws no bodies', substr_count($error->bodies(), ' hidden>') === 2, 'both discs hidden');
+// Nothing may claim a position in the error state: there is none. An edge chip reading
+// "Nap: E-i sav . 0 deg" would be a confident lie.
+ok('the error state claims no azimuth', substr_count($error->edgeChips(), ' hidden>') === 4, 'chips and bands hidden');
+ok('the error state shows no depth markers', substr_count($error->subMarkers(), ' hidden>') === 4, 'markers and lines hidden');
 
 // The loading state has no server-side markup of its own beyond the refresh dot; the dot
 // starts hidden so that a refresh faster than 400 ms never flashes.
