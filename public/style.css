@@ -475,7 +475,13 @@ body {
   font-size: var(--fs-compass);
   font-weight: var(--fw-semi);
   letter-spacing: var(--ls-caps);
-  text-transform: uppercase;
+  /* Spec 6.6 (v1.1): the label text is already final in the markup - "DNy", "Ny" - and the
+     Hungarian digraph "ny" takes a capital on its FIRST letter only. Any case transform here
+     would print DNY/NY, so it is forbidden; the even, sign-like look comes from the weight
+     and the letter-spacing above. Declared explicitly (not just omitted) so that the rule
+     states the intent and tests/render.php can assert it. */
+  text-transform: none;
+  font-variant-caps: normal;
   color: var(--c-text-muted);
   text-shadow: 0 1px 2px rgb(0 0 0 / .65);
   white-space: nowrap;

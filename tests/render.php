@@ -466,6 +466,224 @@ ok('the loop stops when the tab is hidden', str_contains($js, "visibilitychange"
 ok('the headline collision check exists', str_contains($js, 'hello--conflict'), 'spec 8.4');
 
 // ---------------------------------------------------------------------------
+section('8. Compass labels: markup AND stylesheet together (spec 6.6, BUG-0011)');
+// ---------------------------------------------------------------------------
+
+/**
+ * Why this section exists at all.
+ *
+ * BUG-0011 survived a fully green suite. Section 6 asserts that the five compass labels are
+ * in the markup, and they were - the renderer emits "DNy" and "Ny" exactly as spec 6.6
+ * requires. The stylesheet, however, carried `text-transform: uppercase` on .compass__label,
+ * so the visitor read "DNY" and "NY". A test that looks only at the HTML is structurally
+ * incapable of seeing that class of bug: the defect lives in the other file.
+ *
+ * So this section asks the question the way the screen asks it - what text ends up in front
+ * of the visitor? - by reading the markup and the CSS together. `text-transform` is also an
+ * INHERITED property, which is why the fix declares `none` explicitly instead of merely
+ * deleting the line: an `uppercase` on any ancestor would otherwise reintroduce the bug, and
+ * the assertions below would not catch a silent omission.
+ */
+
+/** Spec 6.6 / 8.1 / 13: the same five strings in all three places, byte for byte. */
+$expectedCompassLabels = ['K', 'DK', 'D', 'DNy', 'Ny'];
+
+/**
+ * Collect the declarations of every innermost CSS rule as [selectorList, declarations].
+ * Comments are stripped first (they mention `text-transform` on purpose). The pattern also
+ * reaches rules nested inside @media, because `[^{}]` cannot cross a brace.
+ *
+ * @return list<array{0: string, 1: string}>
+ */
+$cssRules = static function (string $css): array {
+    $css = (string) preg_replace('#/\*.*?\*/#s', '', $css);
+    preg_match_all('/([^{}]+)\{([^{}]*)\}/s', $css, $matches, PREG_SET_ORDER);
+
+    return array_map(static fn (array $m): array => [trim($m[1]), $m[2]], $matches);
+};
+
+/** The declared value of $property in $declarations, or null. Last one wins, as in the cascade. */
+$declaredValue = static function (string $declarations, string $property): ?string {
+    if (preg_match_all('/(?:^|;)\s*' . preg_quote($property, '/') . '\s*:\s*([^;}]+)/i', $declarations, $m) < 1) {
+        return null;
+    }
+
+    return strtolower(trim((string) end($m[1])));
+};
+
+/** Every rule that can reach an element carrying the .compass__label class. */
+$labelRules = [];
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    foreach (explode(',', $selectorList) as $selector) {
+        if (preg_match('/\.compass__label(?![\w-])|\.compass__label--[\w-]+/', trim($selector)) === 1) {
+            $labelRules[] = [trim($selectorList), $declarations];
+            break;
+        }
+    }
+}
+
+ok(
+    'the stylesheet actually has rules for .compass__label',
+    count($labelRules) >= 1,
+    count($labelRules) . ' rule(s) found — if this is 0, every assertion below is vacuous'
+);
+
+/**
+ * Every case-changing declaration that reaches the labels, in source order. `capitalize` and
+ * `lowercase` are listed too: they are just as wrong as `uppercase` ("DNY", "dny", "Dny").
+ */
+$caseChangers = [];
+$effectiveTransform = null;
+foreach ($labelRules as [$selectorList, $declarations]) {
+    $transform = $declaredValue($declarations, 'text-transform');
+    if ($transform !== null) {
+        $effectiveTransform = $transform;
+        if ($transform !== 'none') {
+            $caseChangers[] = $selectorList . ' { text-transform: ' . $transform . ' }';
+        }
+    }
+
+    foreach (['font-variant-caps', 'font-variant'] as $property) {
+        $variant = $declaredValue($declarations, $property);
+        if ($variant !== null && (str_contains($variant, 'small-caps') || str_contains($variant, 'petite-caps')
+            || str_contains($variant, 'unicase') || str_contains($variant, 'titling-caps'))) {
+            $caseChangers[] = $selectorList . ' { ' . $property . ': ' . $variant . ' }';
+        }
+    }
+}
+
+ok(
+    'no case-changing declaration reaches .compass__label (BUG-0011)',
+    $caseChangers === [],
+    $caseChangers === [] ? 'no text-transform/small-caps other than none' : 'found: ' . implode(' | ', $caseChangers)
+);
+ok(
+    '.compass__label declares text-transform: none explicitly (spec 6.6)',
+    $effectiveTransform === 'none',
+    'effective text-transform = ' . var_export($effectiveTransform, true)
+        . ' — an inherited uppercase would re-break the labels unless none is stated'
+);
+
+/** The visual intent of spec 6.6 must survive the fix: weight and tracking, not capitals. */
+// Every rule selected by exactly `.compass__label` - the base one plus the landscape
+// override - concatenated, so that neither can hide the other.
+$baseRule = '';
+foreach ($labelRules as [$selectorList, $declarations]) {
+    if (trim($selectorList) === '.compass__label') {
+        $baseRule .= ';' . $declarations;
+    }
+}
+ok(
+    'the visual intent is kept: font-weight 600 + letter-spacing .14em (spec 6.6)',
+    $declaredValue($baseRule, 'font-weight') === 'var(--fw-semi)'
+        && $declaredValue($baseRule, 'letter-spacing') === 'var(--ls-caps)',
+    'font-weight=' . var_export($declaredValue($baseRule, 'font-weight'), true)
+        . ' letter-spacing=' . var_export($declaredValue($baseRule, 'letter-spacing'), true)
+);
+
+$rootDeclarations = '';
+foreach ($cssRules($css) as [$selectorList, $declarations]) {
+    if (str_contains($selectorList, ':root')) {
+        $rootDeclarations .= $declarations;
+    }
+}
+ok(
+    'the tokens behind that intent hold the spec values (--fw-semi: 600, --ls-caps: .14em)',
+    $declaredValue($rootDeclarations, '--fw-semi') === '600' && $declaredValue($rootDeclarations, '--ls-caps') === '.14em',
+    '--fw-semi=' . var_export($declaredValue($rootDeclarations, '--fw-semi'), true)
+        . ' --ls-caps=' . var_export($declaredValue($rootDeclarations, '--ls-caps'), true)
+);
+
+/** Apply a CSS text-transform the way a browser would. */
+$applyTextTransform = static function (string $text, ?string $transform): string {
+    $upper = static fn (string $s): string => function_exists('mb_strtoupper') ? mb_strtoupper($s, 'UTF-8') : strtoupper($s);
+    $lower = static fn (string $s): string => function_exists('mb_strtolower') ? mb_strtolower($s, 'UTF-8') : strtolower($s);
+
+    return match ($transform) {
+        'uppercase' => $upper($text),
+        'lowercase' => $lower($text),
+        'capitalize' => function_exists('mb_convert_case')
+            ? mb_convert_case($lower($text), MB_CASE_TITLE, 'UTF-8')
+            : ucwords($lower($text)),
+        default => $text,
+    };
+};
+
+/**
+ * The end-to-end assertion: take the labels out of the real markup, put the real stylesheet
+ * on top of them, and compare what is left with the five strings of spec 6.6. This is the
+ * one that would have failed before the fix ("DNy" -> "DNY").
+ */
+foreach (['ok' => $noon, 'error' => $error] as $label => $renderer) {
+    preg_match_all(
+        '/<span class="compass__label[^"]*"[^>]*>([^<]*)<\/span>/',
+        $renderer->compass(),
+        $labelMatches
+    );
+    $inMarkup = $labelMatches[1];
+
+    ok(
+        $label . ': the markup carries the five spec strings verbatim',
+        $inMarkup === $expectedCompassLabels,
+        'markup=[' . implode(' ', $inMarkup) . '] expected=[' . implode(' ', $expectedCompassLabels) . ']'
+    );
+
+    $onScreen = array_map(
+        static fn (string $text): string => $applyTextTransform($text, $effectiveTransform),
+        $inMarkup
+    );
+    ok(
+        $label . ': what the visitor reads, after the stylesheet, is K DK D DNy Ny',
+        $onScreen === $expectedCompassLabels,
+        'on screen=[' . implode(' ', $onScreen) . '] expected=[' . implode(' ', $expectedCompassLabels) . ']'
+            . ' (text-transform=' . var_export($effectiveTransform, true) . ')'
+    );
+    ok(
+        $label . ': no all-caps digraph survives anywhere in the compass',
+        !preg_match('/\bD?NY\b/', implode(' ', $onScreen)),
+        'the Hungarian digraph "ny" takes a capital on its first letter only'
+    );
+}
+
+/**
+ * Self-check on the detector itself. An assertion that cannot fail is worth nothing, and the
+ * assertions above are only as good as the little CSS parser behind them - so the parser is
+ * fed known-bad stylesheets and required to reject every one of them. The fixtures are
+ * literals on purpose: they must keep testing the detector even after public/style.css
+ * changes, and they cover the three ways the bug could come back (the original declaration,
+ * one hidden in a media query, and small-caps instead of a transform).
+ */
+$detectorFixtures = [
+    'the original BUG-0011 declaration' => ['.compass__label { font-weight: 600; text-transform: uppercase; }', 'uppercase'],
+    'a transform hidden inside a media query' => ['@media (min-width: 700px) { .compass__label { text-transform: uppercase; } }', 'uppercase'],
+    'a lowercase transform' => ['.compass__label { text-transform: lowercase; }', 'lowercase'],
+    'a transform behind a comment' => ["/* text-transform: none; */\n.compass__label { text-transform: capitalize; }", 'capitalize'],
+];
+
+foreach ($detectorFixtures as $what => [$fixture, $expectedDetection]) {
+    $detected = null;
+    foreach ($cssRules($fixture) as [$selectorList, $declarations]) {
+        if (preg_match('/\.compass__label(?![\w-])/', $selectorList) === 1) {
+            $detected = $declaredValue($declarations, 'text-transform') ?? $detected;
+        }
+    }
+    ok(
+        'self-check: the detector catches ' . $what,
+        $detected === $expectedDetection && $applyTextTransform('DNy', $detected) !== 'DNy',
+        'detected=' . var_export($detected, true) . ' -> "DNy" would render as "'
+            . $applyTextTransform('DNy', $detected) . '"'
+    );
+}
+
+$smallCapsFixture = '.compass__label { font-variant-caps: small-caps; }';
+$smallCapsCaught = false;
+foreach ($cssRules($smallCapsFixture) as [$selectorList, $declarations]) {
+    $smallCapsCaught = $smallCapsCaught
+        || str_contains((string) $declaredValue($declarations, 'font-variant-caps'), 'small-caps');
+}
+ok('self-check: the detector catches small-caps too', $smallCapsCaught, 'spec 6.6 forbids it as well');
+
+// ---------------------------------------------------------------------------
 echo "\n" . str_repeat('=', 78) . "\n";
 printf("TOTAL: %d passed, %d failed\n", RenderResult::$passed, RenderResult::$failed);
 
