@@ -178,6 +178,7 @@ await cdp('Log.enable');
 /* Console noise is collected with the phase it happened in, so that the errors we cause on
    purpose (killing the network) are not confused with the ones the app produces on its own. */
 let phase = 'startup';
+let apiRequests = 0;
 const consoleErrors = [];
 listeners.push((message) => {
   if (message.sessionId !== sessionId) return;
@@ -186,6 +187,9 @@ listeners.push((message) => {
   }
   if (message.method === 'Log.entryAdded' && ['error', 'warning'].includes(message.params.entry.level)) {
     consoleErrors.push({ phase, kind: message.params.entry.source, text: message.params.entry.text });
+  }
+  if (message.method === 'Network.requestWillBeSent' && /sky\.php/.test(message.params.request.url)) {
+    apiRequests++;
   }
   if (message.method === 'Runtime.exceptionThrown') {
     consoleErrors.push({ phase, kind: 'exception', text: message.params.exceptionDetails.text });
@@ -254,6 +258,27 @@ const finish = async () => {
 
 section('1. prefers-contrast: more — the measured plate (BUG-0013, spec 10.3)');
 
+/**
+ * Wait until the plate stops moving before reading it.
+ *
+ * --plate-alpha is a registered custom property with a 1200 ms transition (spec 7.4), and the
+ * collision class arrives from JS after load - so an immediate read catches a value in flight
+ * (0.455 on its way from 0.42 to 0.62 tells you nothing about either). Two identical reads
+ * 250 ms apart mean the transition is over.
+ */
+const settlePlate = async (timeoutMs = 4000) => {
+  const read = () => evaluate(`return getComputedStyle(document.querySelector('.hello')).backgroundColor;`);
+  const deadline = Date.now() + timeoutMs;
+  let previous = await read();
+  while (Date.now() < deadline) {
+    await sleep(250);
+    const current = await read();
+    if (current === previous) return current;
+    previous = current;
+  }
+  return previous;
+};
+
 /** Reads what the plate is actually painted with, right now, in this browser. */
 const readPlate = () => evaluate(`
   const hello = document.querySelector('.hello');
@@ -278,6 +303,7 @@ ok('the collision case is reachable (?t=2026-06-21T12:30)',
   await waitFor(`document.querySelector('.hello').classList.contains('hello--conflict')`),
   'spec 8.4 — .hello--conflict is what makes the plate 0.62');
 
+await settlePlate();
 const plateBefore = await readPlate();
 const alphaBefore = parseRgba(plateBefore.background)?.alpha ?? NaN;
 ok('no preference: matchMedia says the branch is OFF', plateBefore.matchesContrast === false,
@@ -287,7 +313,7 @@ near('no preference: the collision plate is the spec 8.4 value', alphaBefore, 0.
 
 /* Now ask for high contrast the way the operating system would. */
 await setMedia([{ name: 'prefers-contrast', value: 'more' }]);
-await evaluate('return new Promise(r => requestAnimationFrame(r));');
+await settlePlate();
 const plateAfter = await readPlate();
 const alphaAfter = parseRgba(plateAfter.background)?.alpha ?? NaN;
 
@@ -310,9 +336,10 @@ ok('the high-contrast user is no longer worse off than everyone else', contrastA
 /* And the case with no collision at all: the surcharge must apply there too. */
 await setMedia([]);
 await navigate(`${BASE}/?t=2026-08-17T18:45`);
+await settlePlate();
 const dayBefore = parseRgba((await readPlate()).background)?.alpha ?? NaN;
 await setMedia([{ name: 'prefers-contrast', value: 'more' }]);
-await evaluate('return new Promise(r => requestAnimationFrame(r));');
+await settlePlate();
 const dayAfter = await readPlate();
 const dayAlpha = parseRgba(dayAfter.background)?.alpha ?? NaN;
 ok('without a collision the preference still applies (+.18)', Math.abs(dayAlpha - (dayBefore + 0.18)) < 0.005,
@@ -376,10 +403,16 @@ const measureChip = () => evaluate(`
   return {
     chip: box(chip),
     text: text.textContent,
-    lines: text.getClientRects().length,
+    lines: (() => { const range = document.createRange(); range.selectNodeContents(text);
+      /* getClientRects() on the span itself returns ONE rect - it is a block-level flex item.
+         Only a Range over its text reports the actual line boxes. */
+      return range.getClientRects().length; })(),
+    textHeight: Math.round(text.getBoundingClientRect().height),
+    lineHeight: parseFloat(getComputedStyle(text).lineHeight) || 0,
     button: box(button),
     info: box(document.querySelector('.info')),
     labels: [...document.querySelectorAll('.compass__label')].map(l => ({ text: l.textContent, box: box(l) })),
+    aboveHorizon: chip.classList.contains('errorchip--above-horizon'),
     opacity: getComputedStyle(chip).opacity,
     online: navigator.onLine,
     viewport: { w: innerWidth, h: innerHeight },
@@ -420,17 +453,20 @@ for (const path of paths) {
       await path.stop();
       continue;
     }
+    /* The chip slides in over 240 ms and app.js verifies its placement two frames later; what
+       the visitor looks at is the settled state, so that is what gets measured. */
+    await sleep(600);
 
     const m = await measureChip();
     ok(`${path.name} @ ${viewport.name}: navigator.onLine is as intended`,
       m.online === path.expectOnline, `navigator.onLine=${m.online}`);
     ok(`${path.name} @ ${viewport.name}: the message is at most 2 lines`,
-      m.lines <= 2, `${m.lines} line(s), chip ${m.chip.w}x${m.chip.h}px at (${m.chip.x},${m.chip.y}) — before the fix: 5 lines in a 205px box`);
+      m.lines <= 2, `${m.lines} line box(es) (text ${m.textHeight}px / line-height ${m.lineHeight}px), chip ${m.chip.w}x${m.chip.h}px at (${m.chip.x},${m.chip.y}) — before the fix: 5 lines in a 205px box`);
 
     const covered = m.labels.filter((l) => overlaps(m.chip, l.box)).map((l) => l.text);
     ok(`${path.name} @ ${viewport.name}: no compass label is covered`,
       covered.length === 0,
-      covered.length ? `covered: ${covered.join(' ')}` : `all of ${m.labels.map((l) => l.text).join(' ')} clear`);
+      covered.length ? `covered: ${covered.join(' ')}` : `all of ${m.labels.map((l) => l.text).join(' ')} clear (chip above the horizon: ${m.aboveHorizon})`);
     ok(`${path.name} @ ${viewport.name}: the chip does not overlap the .info strip`,
       !overlaps(m.chip, m.info),
       `chip bottom=${m.chip.bottom.toFixed(1)} info top=${m.info.top.toFixed(1)}`);
@@ -460,6 +496,7 @@ for (const path of paths) {
   await path.start();
   await triggerRefresh();
   await waitFor(`document.querySelector('.errorchip')`);
+  await sleep(500); /* the chip-in animation is 240 ms; reading during it proves nothing */
 
   const early = await evaluate(`return getComputedStyle(document.querySelector('.errorchip')).opacity;`);
   await sleep(9200);
@@ -491,10 +528,15 @@ await navigate(`${BASE}/?t=2026-06-21T12:30`);
 await triggerRefresh();
 await waitFor(`document.querySelector('.errorchip')`);
 
-const key = async (keyName, code, keyCode) => {
-  for (const type of ['rawKeyDown', 'keyUp']) {
-    await cdp('Input.dispatchKeyEvent', { type, key: keyName, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
-  }
+const key = async (keyName, code, keyCode, text) => {
+  /* `rawKeyDown` is enough to move focus, but a default action (Enter activating a button)
+     only happens for a keyDown that carries its text. */
+  await cdp('Input.dispatchKeyEvent', {
+    type: text ? 'keyDown' : 'rawKeyDown',
+    key: keyName, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+    ...(text ? { text, unmodifiedText: text } : {}),
+  });
+  await cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: keyName, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
 };
 
 await key('Tab', 'Tab', 9);
@@ -510,15 +552,16 @@ ok('the focus ring is the spec 9.1 colour', /255,\s*211,\s*122/.test(focused.out
 
 /* Enter must reach the same handler as a click: the label switches to "Frissítés…". */
 await evaluate(`window.__label = document.querySelector('.errorchip__button').textContent; return true;`);
-await key('Enter', 'Enter', 13);
-await sleep(300);
+const requestsBeforeEnter = apiRequests;
+await key('Enter', 'Enter', 13, '\r');
+await sleep(800);
 const afterEnter = await evaluate(`
   const button = document.querySelector('.errorchip__button');
   return { before: window.__label, now: button ? button.textContent : '(chip gone)',
            busy: button ? button.getAttribute('aria-busy') : null };
 `);
-ok('Enter triggers the retry', afterEnter.now === 'Frissítés…' || afterEnter.busy === 'true' || afterEnter.now === '(chip gone)',
-  `"${afterEnter.before}" -> "${afterEnter.now}" (aria-busy=${afterEnter.busy})`);
+ok('Enter triggers the retry (a new request goes out)', apiRequests > requestsBeforeEnter,
+  `${requestsBeforeEnter} -> ${apiRequests} request(s) to the endpoint; button label "${afterEnter.before}" -> "${afterEnter.now}" (aria-busy=${afterEnter.busy})`);
 
 await unblockApi();
 

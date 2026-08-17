@@ -724,6 +724,12 @@ html:not(.js) .hello { --plate-alpha: var(--nojs-alpha); }
   animation: chip-in var(--dur-chip-in) var(--ease-out);
   transition: opacity var(--dur-chip-out) var(--ease-out);
 }
+/* On a landscape phone the ground band is 112px tall and the compass labels sit in the middle
+   of it: a chip with a 44px touch target simply does not fit between the labels and the info
+   strip. When app.js measures that collision it moves the chip above the horizon line instead,
+   over the sky, where nothing is covered. CSS alone cannot decide this - it depends on how tall
+   the message turns out to be. */
+.errorchip--above-horizon { bottom: calc(100% - var(--horizon-y) + var(--space-1)); }
 .errorchip--faded { opacity: .35; }
 @keyframes chip-in {
   from { opacity: 0; transform: translateY(8px); }

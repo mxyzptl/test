@@ -425,6 +425,43 @@
     }
   }
 
+  /* Put the chip where it covers nothing, and check that it really does.
+     Two frames, because each step needs the previous one to have been laid out:
+       1. measure the info strip and publish --info-h (the chip's `bottom` reads it),
+       2. compare the chip's own box with the compass label band; if they meet - the landscape
+          phone leaves 58px between the labels and the info strip, and the chip needs 60 - move
+          the chip above the horizon, over the sky, where there is nothing to cover.
+     Measuring afterwards is what makes this safe for messages of any length: the "3 perce nem
+     frissult" text is twice as long as the first one, and the strip's height changes with the
+     breakpoint and the state. */
+  function placeErrorChip(chip) {
+    requestAnimationFrame(function () {
+      measureInfoStrip();
+
+      requestAnimationFrame(function () {
+        chip.classList.remove('errorchip--above-horizon');
+
+        var labels = document.querySelectorAll('.compass__label');
+        if (!labels.length) {
+          return;
+        }
+
+        var chipBox = chip.getBoundingClientRect();
+        var bandTop = Infinity;
+        var bandBottom = -Infinity;
+        for (var i = 0; i < labels.length; i++) {
+          var box = labels[i].getBoundingClientRect();
+          bandTop = Math.min(bandTop, box.top);
+          bandBottom = Math.max(bandBottom, box.bottom);
+        }
+
+        if (chipBox.bottom > bandTop && bandBottom > chipBox.top) {
+          chip.classList.add('errorchip--above-horizon');
+        }
+      });
+    });
+  }
+
   function ensureErrorChip() {
     if (errorChip) {
       return errorChip;
@@ -477,6 +514,8 @@
     chipTimer = window.setTimeout(function () {
       chip.classList.add('errorchip--faded');
     }, CHIP_FADE_AFTER);
+
+    placeErrorChip(chip);
   }
 
   function hideErrorChip() {
@@ -591,6 +630,10 @@
     resizeTimer = window.setTimeout(function () {
       checkCollision();
       measureInfoStrip();
+      if (errorChip) {
+        /* A rotation changes both the strip's height and the room above it. */
+        placeErrorChip(errorChip);
+      }
     }, RESIZE_DEBOUNCE);
   }
 
