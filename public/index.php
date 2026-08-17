@@ -16,14 +16,32 @@ declare(strict_types=1);
 require_once __DIR__ . '/../src/bootstrap.php';
 
 use Sky\Location;
+use Sky\RequestTime;
 use Sky\Sky;
 use Sky\SkyRenderer;
 
 $location = Location::veresegyhaz();
 
+/**
+ * Optional ?t=<ISO8601>, validated by the same parser the API uses. It exists so that a
+ * tester can actually see midday, sunset or a full moon without waiting for them - design
+ * spec 17 asks for exactly that. An unparseable value is not worth an error page: we fall
+ * back to now, which is what the visitor wanted anyway.
+ */
+$requested = $_GET['t'] ?? null;
+$when = null;
+
+if (is_string($requested) && $requested !== '') {
+    try {
+        $when = RequestTime::parse($requested, $location->timezone());
+    } catch (InvalidArgumentException) {
+        $when = null;
+    }
+}
+
 try {
     $renderer = SkyRenderer::fromSnapshot(
-        Sky::snapshot(new DateTimeImmutable('now', $location->timezone()), $location)
+        Sky::snapshot($when ?? new DateTimeImmutable('now', $location->timezone()), $location)
     );
 } catch (Throwable $e) {
     // Design spec 7.3/a: a calculation failure must never cost us the "Hello World".
