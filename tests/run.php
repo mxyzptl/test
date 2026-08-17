@@ -1175,6 +1175,8 @@ foreach (array_merge(array_keys($invalidOffsets), [
 ok('the parser only ever throws InvalidArgumentException', $onlyInvalidArgument, $leaked === '' ? '16 inputs, no other throwable' : $leaked);
 
 // S3-2: the hour that exists twice. Documented in the contract as the SECOND (winter) reading.
+// BUG-0015: until the fix these two assertions were green at 23:30 and red at 00:05 - section 15
+// runs them again under simulated server clocks so that can never be a matter of luck again.
 $ambiguous = RequestTime::parse('2026-10-25T02:30', $budapest);
 ok(
     'the ambiguous autumn hour resolves to the winter (+01:00) reading',
@@ -1187,6 +1189,239 @@ ok(
     'the first occurrence is still reachable with an explicit offset',
     $ambiguous->getTimestamp() - $firstOccurrence->getTimestamp() === 3600,
     sprintf('difference = %d s (expected 3600)', $ambiguous->getTimestamp() - $firstOccurrence->getTimestamp())
+);
+
+// ---------------------------------------------------------------------------
+section('15. BUG-0015 — ?t= must not depend on the server clock');
+// ---------------------------------------------------------------------------
+
+/*
+ * The two assertions above used to be green at 23:30 and red at 00:05 on the very same code,
+ * because RequestTime built its base from (new DateTimeImmutable('now', $zone))->setDate(...):
+ * setDate() keeps the current time of day, and the DST flag of that intermediate value decided
+ * how the ambiguous hour was resolved. A test that only looks at the current moment cannot see
+ * that - which is exactly why it took a frontend developer working past midnight to find it.
+ *
+ * This section closes the hole three ways:
+ *   15.1  the expected instants come from tzdata (DateTimeZone::getTransitions), not from the
+ *         parser, so a parser that is confidently wrong cannot agree with itself;
+ *   15.2  both edges of both transitions, so the gap and the doubled hour are pinned;
+ *   15.3  the same assertions run again in child processes with a SIMULATED server clock;
+ *   15.4  a structural guard: RequestTime must not read a clock at all.
+ */
+
+// 15.1 Independent reference: read the autumn transition straight out of the zone database.
+$autumnTransitions = array_values(array_filter(
+    $budapest->getTransitions(
+        (new DateTimeImmutable('2026-10-20T00:00:00', new DateTimeZone('UTC')))->getTimestamp(),
+        (new DateTimeImmutable('2026-10-30T00:00:00', new DateTimeZone('UTC')))->getTimestamp()
+    ),
+    static fn (array $t): bool => $t['isdst'] === false && $t['offset'] === 3600
+));
+
+ok(
+    'tzdata really does have a fall-back transition on 2026-10-25',
+    count($autumnTransitions) === 1,
+    isset($autumnTransitions[0])
+        ? 'ts=' . $autumnTransitions[0]['ts'] . ' (' . $autumnTransitions[0]['time'] . ') -> ' . $autumnTransitions[0]['abbr']
+        : 'no CET transition found in the window'
+);
+
+// At the transition instant the local clock reads 03:00 CEST = 02:00 CET. So local 02:30 exists
+// 30 minutes BEFORE it (first, +02:00) and 30 minutes AFTER it (second, +01:00). Neither number
+// comes from RequestTime.
+$fallBackTs = $autumnTransitions[0]['ts'] ?? 0;
+$expectedSecond = $fallBackTs + 1800;
+$expectedFirst = $fallBackTs - 1800;
+
+$parsedSecond = RequestTime::parse('2026-10-25T02:30', $budapest);
+$parsedFirst = RequestTime::parse('2026-10-25T02:30:00+02:00', $budapest);
+
+ok(
+    'the ambiguous hour lands on the instant tzdata calls the second occurrence',
+    $parsedSecond->getTimestamp() === $expectedSecond,
+    sprintf('parsed=%d expected=%d (%s)', $parsedSecond->getTimestamp(), $expectedSecond, $parsedSecond->format('c'))
+);
+
+ok(
+    'the explicit +02:00 form lands on the instant tzdata calls the first occurrence',
+    $parsedFirst->getTimestamp() === $expectedFirst,
+    sprintf('parsed=%d expected=%d (%s)', $parsedFirst->getTimestamp(), $expectedFirst, $parsedFirst->format('c'))
+);
+
+// 15.2 Both edges of both transitions. The gap (spring) must be rejected, the doubled hour
+// (autumn) must resolve to standard time, and the minutes on either side must be untouched.
+$dstEdges = [
+    // input,                     expected offset or null = must be rejected
+    ['2026-03-29T01:59:59', '+01:00'],  // last instant before the spring gap
+    ['2026-03-29T02:00:00', null],      // first instant inside the gap
+    ['2026-03-29T02:30:00', null],      // the middle of the gap (the reported case)
+    ['2026-03-29T02:59:59', null],      // last instant inside the gap
+    ['2026-03-29T03:00:00', '+02:00'],  // first instant after the gap
+    ['2026-10-25T01:59:59', '+02:00'],  // still unambiguous summer time
+    ['2026-10-25T02:00:00', '+01:00'],  // first instant of the doubled hour -> second occurrence
+    ['2026-10-25T02:59:59', '+01:00'],  // last instant of the doubled hour -> second occurrence
+    ['2026-10-25T03:00:00', '+01:00'],  // unambiguous again
+];
+
+foreach ($dstEdges as [$input, $expectedOffset]) {
+    try {
+        $edge = RequestTime::parse($input, $budapest);
+        ok(
+            sprintf('DST edge t=%s -> %s', $input, $expectedOffset ?? 'rejected'),
+            $expectedOffset !== null && $edge->format('P') === $expectedOffset,
+            'offset=' . $edge->format('P') . ' utc=' . $edge->setTimezone(new DateTimeZone('UTC'))->format('H:i:s')
+        );
+    } catch (InvalidArgumentException $e) {
+        ok(
+            sprintf('DST edge t=%s -> %s', $input, $expectedOffset ?? 'rejected'),
+            $expectedOffset === null,
+            'rejected: ' . $e->getMessage()
+        );
+    }
+}
+
+// 15.3 The same questions, asked again from child processes whose clock is somewhere else.
+// This is the only assertion in the suite that actually moves the server clock; everything else
+// can only ever see the moment it happens to run at.
+$faketime = trim((string) (@shell_exec('command -v faketime 2>/dev/null') ?? ''));
+
+if ($faketime === '') {
+    record(
+        false,
+        'a simulated server clock is available (faketime)',
+        'faketime not found - install it with: sudo apt-get install -y faketime. Without it the '
+        . 'clock-dependence of ?t= cannot be tested, and BUG-0015 could come back unnoticed.'
+    );
+} else {
+    record(true, 'a simulated server clock is available (faketime)', $faketime);
+
+    /*
+     * Each clock is a moment that used to give a different answer:
+     *   00:05  the window the bug report was filed from (00:00-02:59 answered +02:00)
+     *   12:00  the middle of the day, where the suite always looked green
+     *   23:30  the moment the previous agent ran the suite at
+     *   the ambiguous hour itself, as the server clock - the nastiest base the old code could get
+     *   the day of the spring transition
+     */
+    $simulatedClocks = [
+        '2026-08-18 00:05:00',
+        '2026-08-18 12:00:00',
+        '2026-08-18 23:30:00',
+        '2026-10-25 02:30:00',
+        '2026-03-29 12:00:00',
+    ];
+
+    $childCode = <<<'PHP'
+        require_once %s;
+        $z = new DateTimeZone('Europe/Budapest');
+        $out = ['clock' => (new DateTimeImmutable('now', $z))->format('Y-m-d H:i')];
+        foreach (['2026-10-25T02:30', '2026-10-25T02:30:00+02:00', '2026-03-29T02:30'] as $in) {
+            try {
+                $r = \Sky\RequestTime::parse($in, $z);
+                $out[$in] = ['offset' => $r->format('P'), 'ts' => $r->getTimestamp()];
+            } catch (InvalidArgumentException $e) {
+                $out[$in] = ['rejected' => true];
+            }
+        }
+        echo json_encode($out);
+        PHP;
+
+    $childCode = sprintf($childCode, var_export(__DIR__ . '/../src/bootstrap.php', true));
+
+    foreach ($simulatedClocks as $clock) {
+        /*
+         * -f '@<date>' is an ABSOLUTE fake time, and the env is scrubbed first: plain
+         * `faketime "<date>"` computes an offset from the time it can see, so if this suite is
+         * itself already running under faketime the children would silently inherit that offset
+         * and every clock in the matrix would collapse back onto the real one. (That is not a
+         * hypothetical - it happened while writing this, and the "really took effect" assertion
+         * below is what caught it.)
+         */
+        $command = sprintf(
+            'env -u LD_PRELOAD -u FAKETIME -u FAKETIME_FMT -u FAKETIME_DID_REEXEC '
+            . 'faketime -f %s %s -r %s 2>/dev/null',
+            escapeshellarg('@' . $clock),
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg($childCode)
+        );
+
+        /** @var array<string, mixed>|null $child */
+        $child = json_decode((string) (@shell_exec($command) ?? ''), true);
+
+        if (!is_array($child)) {
+            record(false, "server clock $clock: the child process answered", 'no parsable output');
+
+            continue;
+        }
+
+        // Without this the whole matrix could be five copies of the same real clock.
+        ok(
+            "server clock $clock: the simulated clock really took effect",
+            $child['clock'] === substr($clock, 0, 16),
+            'the child saw ' . $child['clock']
+        );
+
+        ok(
+            "server clock $clock: the ambiguous autumn hour resolves to the winter (+01:00) reading",
+            ($child['2026-10-25T02:30']['offset'] ?? null) === '+01:00'
+                && ($child['2026-10-25T02:30']['ts'] ?? null) === $expectedSecond,
+            'offset=' . ($child['2026-10-25T02:30']['offset'] ?? 'rejected')
+                . ' ts=' . ($child['2026-10-25T02:30']['ts'] ?? '-') . ' expected=' . $expectedSecond
+        );
+
+        ok(
+            "server clock $clock: the first occurrence is still reachable with an explicit offset",
+            isset($child['2026-10-25T02:30']['ts'], $child['2026-10-25T02:30:00+02:00']['ts'])
+                && $child['2026-10-25T02:30']['ts'] - $child['2026-10-25T02:30:00+02:00']['ts'] === 3600,
+            sprintf(
+                'difference = %s s (expected 3600)',
+                isset($child['2026-10-25T02:30']['ts'], $child['2026-10-25T02:30:00+02:00']['ts'])
+                    ? (string) ($child['2026-10-25T02:30']['ts'] - $child['2026-10-25T02:30:00+02:00']['ts'])
+                    : '-'
+            )
+        );
+
+        ok(
+            "server clock $clock: the non-existent spring hour is still rejected",
+            ($child['2026-03-29T02:30']['rejected'] ?? false) === true,
+            'answer: ' . json_encode($child['2026-03-29T02:30'])
+        );
+    }
+}
+
+// 15.4 Structural guard. The behavioural checks above can only run where faketime exists; this
+// one runs everywhere and fails on the old code at any hour of the day. Comments are skipped on
+// purpose - the docblock in RequestTime quotes the broken line so it does not get reintroduced.
+$requestTimeTokens = token_get_all((string) file_get_contents(__DIR__ . '/../src/RequestTime.php'));
+$clockReads = [];
+
+foreach ($requestTimeTokens as $token) {
+    if (!is_array($token)) {
+        continue;
+    }
+
+    [$id, $text] = $token;
+
+    if ($id === T_COMMENT || $id === T_DOC_COMMENT) {
+        continue;
+    }
+
+    if ($id === T_CONSTANT_ENCAPSED_STRING
+        && in_array(strtolower(trim($text, '\'"')), ['now', 'today', 'tomorrow', 'yesterday'], true)) {
+        $clockReads[] = $text;
+    }
+
+    if ($id === T_STRING
+        && in_array(strtolower($text), ['time', 'mktime', 'strtotime', 'microtime', 'hrtime', 'gettimeofday', 'getdate'], true)) {
+        $clockReads[] = $text . '()';
+    }
+}
+
+ok(
+    'RequestTime reads no clock at all, so ?t= cannot depend on one',
+    $clockReads === [],
+    $clockReads === [] ? 'no clock read outside comments' : 'found: ' . implode(', ', $clockReads)
 );
 
 // ---------------------------------------------------------------------------
