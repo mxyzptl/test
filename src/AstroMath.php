@@ -256,26 +256,72 @@ final class AstroMath
         return self::norm360($theta0 + $deltaPsi * self::cosDeg($eps));
     }
 
+    /** Bennett's formula is used unchanged down to this geometric altitude (degrees). */
+    public const REFRACTION_VALID_FLOOR_DEG = -1.0;
+
+    /** At and below this geometric altitude the modelled refraction is exactly zero. */
+    public const REFRACTION_FADE_FLOOR_DEG = -6.0;
+
     /**
      * Atmospheric refraction to be ADDED to a geometric altitude, in degrees.
      * Bennett's formula, Meeus (16.4), for standard conditions (1010 mbar, 10 C).
      *
-     * Below -1 deg the body is far enough under the horizon that refraction is neither
-     * meaningful nor needed for rendering, so we return 0 there.
+     * BELOW -1 deg (BUG-0008). Bennett's fit is only quoted down to about -1 deg, but simply
+     * returning 0 there put a 0.647 deg CLIFF into a value this project publishes and colours
+     * the sky from: one 10 s step moved sun.altitude_deg from -1.0172 to -0.3459, the band edge
+     * at -0.833 deg could never be reached, and the sky at the published sunset minute was
+     * already "civil" instead of "golden". So instead of a cut we fade the correction out
+     * smoothly with a smoothstep, from its -1 deg value to exactly 0 at -6 deg:
+     *
+     *     R(h) = R(-1) * s^2 * (3 - 2s),   s = (h + 6) / 5
+     *
+     * Three properties this choice buys, and why each one matters:
+     *
+     *  1. CONTINUITY. R is continuous at -1 (s = 1 gives exactly R(-1)) and C1-smooth at -6
+     *     (s = 0 gives value AND slope 0). The largest |dR/dh| inside the fade is 0.194, so the
+     *     apparent altitude h + R(h) stays strictly increasing - no jump, no fold-back.
+     *  2. THE TWILIGHT BOUNDARIES DO NOT MOVE. Rise/set and the -6/-12/-18 twilight events are
+     *     found on the GEOMETRIC altitude (SolarPosition::events()), while SkyPalette bands the
+     *     APPARENT one. They only agree if refraction is exactly 0 at -6, -12 and -18 - which is
+     *     why the fade ends precisely at -6 and not somewhere convenient.
+     *  3. NOTHING ABOVE THE HORIZON CHANGES. For h >= -1 this is byte-for-byte the old formula,
+     *     so the JPL Horizons agreement of the visible sky is untouched.
+     *
+     * Honest about what it is: between -1 and -6 deg the light path is blocked by the Earth, so
+     * there is no measurable "apparent altitude" to be right or wrong about. Extending Bennett
+     * itself is not an option either - its argument h + 10.3/(h+5.11) turns around at -1.90 deg
+     * and blows up at -5.11 deg, where the formula returns negative refraction. The fade is a
+     * DEFINITION, documented in the API contract, whose only job is that the sky colour derived
+     * from this number never jumps.
      */
     public static function refractionDeg(float $geometricAltitudeDeg): float
     {
-        if ($geometricAltitudeDeg < -1.0) {
+        if ($geometricAltitudeDeg <= self::REFRACTION_FADE_FLOOR_DEG) {
             return 0.0;
         }
 
-        $h = $geometricAltitudeDeg;
+        if ($geometricAltitudeDeg < self::REFRACTION_VALID_FLOOR_DEG) {
+            $s = ($geometricAltitudeDeg - self::REFRACTION_FADE_FLOOR_DEG)
+                / (self::REFRACTION_VALID_FLOOR_DEG - self::REFRACTION_FADE_FLOOR_DEG);
+
+            return self::bennettRefractionDeg(self::REFRACTION_VALID_FLOOR_DEG) * $s * $s * (3.0 - 2.0 * $s);
+        }
+
+        return self::bennettRefractionDeg($geometricAltitudeDeg);
+    }
+
+    /** Bennett's formula itself, Meeus (16.4). Only valid for h >= -1 deg. */
+    private static function bennettRefractionDeg(float $h): float
+    {
         $arcminutes = 1.02 / self::tanDeg($h + 10.3 / ($h + 5.11)) + 0.0019279;
 
         return $arcminutes / 60.0;
     }
 
-    /** Apparent (refracted) altitude from a geometric altitude, degrees. */
+    /**
+     * Apparent (refracted) altitude from a geometric altitude, degrees.
+     * Continuous and strictly increasing over the whole range - see refractionDeg().
+     */
     public static function applyRefraction(float $geometricAltitudeDeg): float
     {
         return $geometricAltitudeDeg + self::refractionDeg($geometricAltitudeDeg);
