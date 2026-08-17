@@ -796,13 +796,59 @@ ok(
     '--conflict-alpha=' . var_export($declaredValue($rootDeclarations, '--conflict-alpha'), true)
 );
 
+/**
+ * The body of every @media block whose condition mentions $needle.
+ *
+ * $cssRules() finds rules nested in a media query, but it loses the condition on the way (its
+ * `[^{}]+` cannot carry the prelude across the brace), so it cannot tell "inside
+ * prefers-contrast" from "anywhere". Brace counting can.
+ */
+$mediaBody = static function (string $css, string $needle): string {
+    $css = (string) preg_replace('#/\*.*?\*/#s', '', $css);
+    $body = '';
+    $offset = 0;
+    $length = strlen($css);
+
+    while (($start = strpos($css, '@media', $offset)) !== false) {
+        $open = strpos($css, '{', $start);
+        if ($open === false) {
+            break;
+        }
+
+        $depth = 1;
+        $i = $open + 1;
+        for (; $i < $length && $depth > 0; $i++) {
+            $depth += ($css[$i] === '{' ? 1 : ($css[$i] === '}' ? -1 : 0));
+        }
+
+        if (str_contains(substr($css, $start, $open - $start), $needle)) {
+            $body .= substr($css, $open + 1, $i - $open - 2) . "\n";
+        }
+        $offset = $i;
+    }
+
+    return $body;
+};
+
+$contrastBody = $mediaBody($css, 'prefers-contrast');
+ok(
+    'the prefers-contrast media block is found (and is not empty)',
+    trim($contrastBody) !== '' && $mediaBody($css, 'prefers-reduced-motion') !== '',
+    strlen($contrastBody) . ' bytes — the assertions below read this block, not the whole file'
+);
+
 /** The surcharge declared inside the prefers-contrast block, whatever property carries it. */
 $contrastBoost = null;
-foreach ($cssRules($css) as [$selectorList, $declarations]) {
-    if (str_contains($selectorList, 'prefers-contrast') && str_contains($selectorList, '.hello')) {
+foreach ($cssRules($contrastBody) as [$selectorList, $declarations]) {
+    if (preg_match('/\.hello(?![\w-])/', $selectorList) === 1) {
         $contrastBoost = $declaredValue($declarations, '--plate-boost') ?? $contrastBoost;
     }
 }
+ok(
+    'no cycle sneaked back into the prefers-contrast block itself',
+    $selfReferentialCustomProps($contrastBody) === [],
+    'this is the exact block BUG-0013 lived in'
+);
 ok(
     'the prefers-contrast block raises the plate by the spec 10.3 surcharge (+.18)',
     $contrastBoost !== null && abs((float) $contrastBoost - 0.18) < 1e-9,
