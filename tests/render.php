@@ -173,17 +173,49 @@ foreach ([[0.0, 0.0, -1.0, 'up'], [90.0, 1.0, 0.0, 'right'], [180.0, 0.0, 1.0, '
 }
 
 /**
- * The real check: over a whole year, whenever both bodies are drawn on the panorama and
- * they are not almost on top of each other, the drawn bright limb must face the drawn Sun.
+ * The rigorous check, independent of the backend's own maths: the position angle of the
+ * Sun as seen from the Moon, from the zenith direction towards increasing azimuth,
+ * computed straight from the two direction vectors in the horizontal frame.
  *
- * Measured in screen pixels of the desktop breakpoint (1280x800, horizon at 78 %), because
- * that is the frame the visitor actually judges it in. Some deviation is expected and
- * intended: the panorama maps 180 deg across the width but only 90 deg down to the horizon,
- * so it is mildly anisotropic (spec 3.3). The spec's own sanity bound is +/- 30 deg.
+ * This is the number the renderer feeds into rotate(chi - 90), so if the convention ever
+ * flips again - which is exactly what happened once already, between contract v1 and v2 -
+ * this assertion is what catches it.
  */
-$worst = 0.0;
-$worstAt = '';
+function exactChi(float $sunAz, float $sunAlt, float $moonAz, float $moonAlt): float
+{
+    $vector = static fn (float $az, float $alt): array => [
+        cos(deg2rad($alt)) * cos(deg2rad($az)),   // north
+        cos(deg2rad($alt)) * sin(deg2rad($az)),   // east
+        sin(deg2rad($alt)),                       // up
+    ];
+    $dot = static fn (array $a, array $b): float => $a[0] * $b[0] + $a[1] * $b[1] + $a[2] * $b[2];
+
+    $moon = $vector($moonAz, $moonAlt);
+    $sun = $vector($sunAz, $sunAlt);
+
+    // Tangent basis at the Moon: "up" towards the zenith, "along" towards larger azimuth.
+    $vertical = $dot([0.0, 0.0, 1.0], $moon);
+    $up = [-$vertical * $moon[0], -$vertical * $moon[1], 1.0 - $vertical * $moon[2]];
+    $length = sqrt($dot($up, $up));
+    $up = [$up[0] / $length, $up[1] / $length, $up[2] / $length];
+    $along = [-sin(deg2rad($moonAz)), cos(deg2rad($moonAz)), 0.0];
+
+    $projection = $dot($sun, $moon);
+    $tangent = [
+        $sun[0] - $projection * $moon[0],
+        $sun[1] - $projection * $moon[1],
+        $sun[2] - $projection * $moon[2],
+    ];
+
+    return norm360(rad2deg(atan2($dot($tangent, $along), $dot($tangent, $up))));
+}
+
+$worstExact = 0.0;
+$worstExactAt = '';
+$worstScreen = 0.0;
+$worstScreenAt = '';
 $samples = 0;
+$screenSamples = 0;
 
 for ($hour = 0; $hour < 8760; $hour += 7) {
     $when = (new DateTimeImmutable('2026-01-01 00:00:00', $budapest))->modify('+' . $hour . ' hour');
@@ -196,36 +228,67 @@ for ($hour = 0; $hour < 8760; $hour += 7) {
         continue;
     }
 
+    $samples++;
+    $actual = norm360((float) $snapshot['moon']['bright_limb_angle_deg']);
+
+    $deviation = abs(norm180($actual - exactChi(
+        (float) $snapshot['sun']['azimuth_deg'],
+        (float) $snapshot['sun']['altitude_deg'],
+        (float) $snapshot['moon']['azimuth_deg'],
+        (float) $snapshot['moon']['altitude_deg']
+    )));
+
+    if ($deviation > $worstExact) {
+        $worstExact = $deviation;
+        $worstExactAt = $when->format('Y-m-d H:i');
+    }
+
+    /**
+     * The visual check the spec and the tester use: measured in the screen pixels of the
+     * desktop breakpoint (1280x800, horizon at 78 %). Only meaningful while the two bodies
+     * are reasonably close - the panorama maps 180 deg across the width but 90 deg down to
+     * the horizon, so a wide separation is legitimately distorted (spec 3.3), and a flat
+     * screen chord stops standing in for a direction on a sphere.
+     */
     $separation = hypot(
-        norm180($snapshot['sun']['azimuth_deg'] - $snapshot['moon']['azimuth_deg'])
-            * cos(deg2rad($snapshot['moon']['altitude_deg'])),
-        $snapshot['sun']['altitude_deg'] - $snapshot['moon']['altitude_deg']
+        norm180((float) $snapshot['sun']['azimuth_deg'] - (float) $snapshot['moon']['azimuth_deg'])
+            * cos(deg2rad((float) $snapshot['moon']['altitude_deg'])),
+        (float) $snapshot['sun']['altitude_deg'] - (float) $snapshot['moon']['altitude_deg']
     );
 
-    if ($separation < 8.0) {
+    if ($separation < 8.0 || $separation > 30.0) {
         continue;
     }
 
-    $dx = ($sun['x'] - $moon['x']) / 100.0 * 1280.0;
-    $dy = ($sun['k'] - $moon['k']) * 800.0 * 0.78;
+    $screenSamples++;
 
-    $expected = norm360(rad2deg(atan2($dx, -$dy)));
-    $actual = norm360((float) $snapshot['moon']['bright_limb_angle_deg']);
-    $deviation = abs(norm180($actual - $expected));
+    $expected = norm360(rad2deg(atan2(
+        ($sun['x'] - $moon['x']) / 100.0 * 1280.0,
+        -(($sun['k'] - $moon['k']) * 800.0 * 0.78)
+    )));
 
-    $samples++;
+    $screenDeviation = abs(norm180($actual - $expected));
 
-    if ($deviation > $worst) {
-        $worst = $deviation;
-        $worstAt = $when->format('Y-m-d H:i');
+    if ($screenDeviation > $worstScreen) {
+        $worstScreen = $screenDeviation;
+        $worstScreenAt = $when->format('Y-m-d H:i');
     }
 }
 
-ok('year-long sample found usable cases', $samples > 100, $samples . ' samples with both bodies drawn');
+ok('year-long sample found usable cases', $samples > 100, $samples . ' hours with both bodies drawn');
 ok(
-    'the drawn bright limb faces the drawn Sun, all year',
-    $worst <= 30.0,
-    sprintf('worst deviation %.2f deg at %s (spec bound 30 deg)', $worst, $worstAt)
+    'the bright-limb angle IS the direction of the Sun, all year',
+    $worstExact <= 3.0,
+    sprintf(
+        'worst deviation %.3f deg at %s (residual is the topocentric/geocentric difference)',
+        $worstExact,
+        $worstExactAt
+    )
+);
+ok(
+    'the drawn bright limb faces the drawn Sun on screen (separation 8-30 deg)',
+    $worstScreen <= 30.0,
+    sprintf('worst %.2f deg at %s over %d samples (spec bound 30 deg)', $worstScreen, $worstScreenAt, $screenSamples)
 );
 
 // ---------------------------------------------------------------------------
@@ -322,7 +385,7 @@ $error = SkyRenderer::errorState();
 ok('the error state exists', $error->state() === 'error', 'state=' . $error->state());
 ok('the error state falls back to a night sky', $error->phase() === 'night', 'phase=' . $error->phase());
 ok('the error state names the way out', str_contains($error->info(), 'Frissítsd az oldalt pár perc múlva.'), '');
-ok('the error state draws no bodies', substr_count($error->bodies(), 'hidden') === 2, 'both discs hidden');
+ok('the error state draws no bodies', substr_count($error->bodies(), ' hidden>') === 2, 'both discs hidden');
 
 // The loading state has no server-side markup of its own beyond the refresh dot; the dot
 // starts hidden so that a refresh faster than 400 ms never flashes.
@@ -384,7 +447,8 @@ $js = (string) file_get_contents(__DIR__ . '/../public/app.js');
 $php = (string) file_get_contents(__DIR__ . '/../public/index.php');
 
 ok('the stylesheet loads nothing from the network', !str_contains($css, 'url('), 'no url() at all');
-ok('the stylesheet declares no webfont', !str_contains($css, '@font-face'), '');
+// The words "@font-face" and "CDN" appear in the comments; look for the actual at-rule.
+ok('the stylesheet declares no webfont', preg_match('/^\s*@font-face/m', $css) !== 1, 'no @font-face rule');
 ok('the stylesheet has the reduced-motion block', str_contains($css, 'prefers-reduced-motion'), '');
 ok('the stylesheet has the high-contrast block', str_contains($css, 'prefers-contrast'), '');
 ok('the stylesheet has the dvh fallback', str_contains($css, 'not (height: 100dvh)'), '');
