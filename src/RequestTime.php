@@ -20,6 +20,12 @@ final class RequestTime
     private const MIN_YEAR = 1900;
     private const MAX_YEAR = 2100;
 
+    /**
+     * Widest UTC offset that exists on Earth (Line Islands, +14:00), which is also the range
+     * DateTimeZone accepts. Anything outside is a client mistake, not a place. See BUG-0009.
+     */
+    private const MAX_OFFSET_MINUTES = 14 * 60;
+
     private const PATTERN = '/^(\d{4})-(\d{2})-(\d{2})'          // date
         . '(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?'                // optional time
         . '(Z|[+-]\d{2}:?\d{2})?$/';                             // optional zone
@@ -89,9 +95,29 @@ final class RequestTime
             );
         }
 
+        // The mirror image - a local time that exists TWICE (the autumn fall-back hour, e.g.
+        // 2026-10-25 02:30 in Europe/Budapest) - cannot be rejected the same way: both readings
+        // are legitimate. PHP resolves it to the standard-time (CET, +01:00) occurrence, i.e. the
+        // SECOND one, and the contract now says so explicitly instead of leaving it to chance
+        // (S3-2). generated_at always carries the resolved offset, so the client can see which
+        // one it got, and ?t=...+02:00 asks for the first occurrence. Pinned by a test.
+
         return $parsed;
     }
 
+    /**
+     * The regex only guarantees the SHAPE of the offset ([+-]dd:?dd), not that such an offset
+     * exists. Two things went wrong before BUG-0009 was fixed:
+     *
+     *   "+9999" -> DateTimeZone threw DateInvalidTimeZoneException (PHP >= 8.3), which is NOT an
+     *             InvalidArgumentException, so it escaped the catch in api/sky.php: 500, empty body.
+     *   "+2400" -> accepted; the answer was silently for a different day.
+     *   "+0099" -> accepted as +01:39; a plausible-looking answer for the wrong instant.
+     *
+     * So the offset is validated here, in numbers, before DateTimeZone ever sees it.
+     *
+     * @throws \InvalidArgumentException with a message that is safe to show to the client
+     */
     private static function resolveZone(string $offset, \DateTimeZone $defaultZone): \DateTimeZone
     {
         if ($offset === '') {
@@ -102,11 +128,18 @@ final class RequestTime
             return new \DateTimeZone('UTC');
         }
 
-        // Normalise "+0200" to "+02:00" so DateTimeZone accepts it.
-        if (!str_contains($offset, ':')) {
-            $offset = substr($offset, 0, 3) . ':' . substr($offset, 3);
+        $sign = $offset[0] === '-' ? -1 : 1;
+        $digits = str_replace(':', '', substr($offset, 1));
+        $hours = (int) substr($digits, 0, 2);
+        $minutes = (int) substr($digits, 2, 2);
+
+        if ($minutes > 59 || $hours * 60 + $minutes > self::MAX_OFFSET_MINUTES) {
+            throw new \InvalidArgumentException(
+                'A "t" paraméterben megadott időzóna-eltolás érvénytelen. '
+                . 'Megengedett: -14:00 és +14:00 között, a perc rész legfeljebb 59.'
+            );
         }
 
-        return new \DateTimeZone($offset);
+        return new \DateTimeZone(sprintf('%s%02d:%02d', $sign < 0 ? '-' : '+', $hours, $minutes));
     }
 }

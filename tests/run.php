@@ -899,6 +899,297 @@ ok(
 echo "\n  sample response:\n  " . $json . "\n";
 
 // ---------------------------------------------------------------------------
+section('13. BUG-0008 — refraction is continuous, and sunset is golden');
+// ---------------------------------------------------------------------------
+
+/*
+ * What broke: refractionDeg() returned 0 below -1 deg, so the PUBLISHED altitude fell off a
+ * 0.647 deg cliff (-1.0172 -> -0.3459 in one 10 s step), the -0.833 deg band edge was never
+ * reachable, and the sky at the published sunset minute was "civil" instead of "golden".
+ *
+ * These assertions are written against the OBSERVABLE quantity (the altitude the API publishes
+ * and the palette is derived from), not against the formula, so they also close the M2 mutation
+ * hole the tester found: switching refraction off now fails here loudly.
+ */
+
+// 13.1 The function itself: continuous everywhere, zero exactly where the twilight events live.
+near('refraction is continuous at the -1 deg seam (left)', AstroMath::refractionDeg(-1.0 - 1e-9), AstroMath::refractionDeg(-1.0), 1e-6, ' deg');
+near('refraction at -1 deg is still Bennett (0.6466)', AstroMath::refractionDeg(-1.0), 0.646613, 1e-5, ' deg');
+near('refraction is exactly 0 at -6 deg (civil twilight)', AstroMath::refractionDeg(-6.0), 0.0, 0.0, ' deg');
+near('refraction is exactly 0 at -12 deg (nautical)', AstroMath::refractionDeg(-12.0), 0.0, 0.0, ' deg');
+near('refraction is exactly 0 at -18 deg (astronomical)', AstroMath::refractionDeg(-18.0), 0.0, 0.0, ' deg');
+near('refraction is continuous at the -6 deg seam', AstroMath::refractionDeg(-6.0 + 1e-6), 0.0, 1e-9, ' deg');
+// Bennett extended by hand would go NEGATIVE around -5.09 deg (its argument passes 180 deg
+// there) and diverges at -5.11. The fade must not do either: non-negative and bounded by the
+// -1 deg value all the way down, and matching the smoothstep the contract publishes.
+$fadeSane = true;
+$fadeMatchesContract = true;
+$refractionAtSeam = AstroMath::refractionDeg(-1.0);
+for ($h = -6.0; $h <= -1.0; $h += 0.001) {
+    $r = AstroMath::refractionDeg($h);
+    if ($r < 0.0 || $r > $refractionAtSeam) {
+        $fadeSane = false;
+        break;
+    }
+    $s = ($h + 6.0) / 5.0;
+    if (abs($r - $refractionAtSeam * $s * $s * (3.0 - 2.0 * $s)) > 1e-12) {
+        $fadeMatchesContract = false;
+        break;
+    }
+}
+ok('refraction below -1 deg stays in [0, R(-1)] (never negative, never diverges)', $fadeSane, 'swept -6..-1 in 0.001 deg steps');
+ok('the fade is exactly the smoothstep the contract documents', $fadeMatchesContract, 'R(h) = R(-1) * s^2 * (3-2s), s = (h+6)/5');
+
+// 13.2 Apparent altitude as a FUNCTION of geometric altitude: no jump, no fold-back.
+$worstAltitudeStep = 0.0;
+$worstAltitudeStepAt = 0.0;
+$strictlyIncreasing = true;
+$previousApparent = AstroMath::applyRefraction(-90.0);
+for ($i = 1; $i <= 180000; $i++) {
+    $h = -90.0 + $i * 0.001;
+    $apparent = AstroMath::applyRefraction($h);
+    $step = $apparent - $previousApparent;
+
+    if ($step <= 0.0) {
+        $strictlyIncreasing = false;
+    }
+    if (abs($step) > $worstAltitudeStep) {
+        $worstAltitudeStep = abs($step);
+        $worstAltitudeStepAt = $h;
+    }
+    $previousApparent = $apparent;
+}
+record(
+    $worstAltitudeStep < 0.0025,
+    'apparent altitude has no jump over -90..+90 deg',
+    sprintf('largest step per 0.001 deg = %.6f deg at h=%+.3f (limit 0.0025)', $worstAltitudeStep, $worstAltitudeStepAt)
+);
+ok('apparent altitude is strictly increasing (never folds back)', $strictlyIncreasing, 'swept in 0.001 deg steps');
+
+// 13.3 The band edge the contract documents must actually be reachable.
+$reachesBandEdge = false;
+for ($h = -3.0; $h <= 0.0; $h += 0.0005) {
+    if (abs(AstroMath::applyRefraction($h) - (-0.833)) < 0.001) {
+        $reachesBandEdge = true;
+        break;
+    }
+}
+ok('the -0.833 deg band edge is actually reachable', $reachesBandEdge, 'the published altitude passes through it');
+
+// 13.4 Refraction is really applied to what we publish (closes mutation M2).
+$noonUtc = utc('2026-08-17 10:00:00');
+$noonSun = SolarPosition::at($noonUtc, $veresegyhaz);
+record(
+    $noonSun->altitudeDeg > $noonSun->geometricAltitudeDeg,
+    'published Sun altitude is refracted, not geometric',
+    sprintf('apparent=%.6f geometric=%.6f diff=%.6f deg', $noonSun->altitudeDeg, $noonSun->geometricAltitudeDeg, $noonSun->altitudeDeg - $noonSun->geometricAltitudeDeg)
+);
+$horizonSun = SolarPosition::at(utc('2026-08-17 17:50:00'), $veresegyhaz);
+near(
+    'refraction just below the horizon is the expected ~0.6 deg',
+    $horizonSun->altitudeDeg - $horizonSun->geometricAltitudeDeg,
+    0.6,
+    0.3,
+    ' deg'
+);
+
+// 13.5 The regression the tester asked for: 1 s steps through the hour around sunset.
+/** @return array{worst: float, at: string} */
+$scanAltitude = static function (callable $altitudeAt, DateTimeImmutable $from, int $seconds, int $stepSeconds): array {
+    $worst = 0.0;
+    $worstAt = '';
+    $previous = $altitudeAt($from);
+
+    for ($s = $stepSeconds; $s <= $seconds; $s += $stepSeconds) {
+        $moment = $from->modify("+$s seconds");
+        $altitude = $altitudeAt($moment);
+        $step = abs($altitude - $previous);
+
+        if ($step > $worst) {
+            $worst = $step;
+            $worstAt = $moment->format('Y-m-d H:i:s');
+        }
+        $previous = $altitude;
+    }
+
+    return ['worst' => $worst, 'at' => $worstAt];
+};
+
+$sunAltitudeAt = static fn (DateTimeImmutable $m): float => SolarPosition::at($m, $veresegyhaz)->altitudeDeg;
+$moonAltitudeAt = static fn (DateTimeImmutable $m): float => LunarPosition::at($m, $veresegyhaz)->altitudeDeg;
+
+// 2026-08-17 sunset is 19:54 local; scan 19:24 -> 20:24 local, one second at a time.
+$sunsetScan = $scanAltitude($sunAltitudeAt, new DateTimeImmutable('2026-08-17 19:24:00', $budapest), 3600, 1);
+record(
+    $sunsetScan['worst'] < 0.01,
+    'sun.altitude_deg step over the sunset hour (1 s steps)',
+    sprintf('largest = %.6f deg at %s (limit 0.01)', $sunsetScan['worst'], $sunsetScan['at'])
+);
+
+// The same for sunrise, and for the whole day at 10 s - this is where the 0.6712 deg jump was.
+$sunriseScan = $scanAltitude($sunAltitudeAt, new DateTimeImmutable('2026-08-17 05:09:00', $budapest), 3600, 1);
+record(
+    $sunriseScan['worst'] < 0.01,
+    'sun.altitude_deg step over the sunrise hour (1 s steps)',
+    sprintf('largest = %.6f deg at %s (limit 0.01)', $sunriseScan['worst'], $sunriseScan['at'])
+);
+
+$dayScan = $scanAltitude($sunAltitudeAt, new DateTimeImmutable('2026-08-17 00:00:00', $budapest), 86400, 10);
+record(
+    $dayScan['worst'] < 0.05,
+    'sun.altitude_deg step over a whole day (10 s steps)',
+    sprintf('largest = %.6f deg at %s (limit 0.05, was 0.6712)', $dayScan['worst'], $dayScan['at'])
+);
+
+// The Moon shares the same refraction, and the tester measured the jump on it too.
+$moonScan = $scanAltitude($moonAltitudeAt, new DateTimeImmutable('2026-08-17 21:00:00', $budapest), 3600, 1);
+record(
+    $moonScan['worst'] < 0.01,
+    'moon.altitude_deg step around moonset (1 s steps)',
+    sprintf('largest = %.6f deg at %s (limit 0.01)', $moonScan['worst'], $moonScan['at'])
+);
+
+$moonDayScan = $scanAltitude($moonAltitudeAt, new DateTimeImmutable('2026-08-17 00:00:00', $budapest), 86400, 10);
+record(
+    $moonDayScan['worst'] < 0.05,
+    'moon.altitude_deg step over a whole day (10 s steps)',
+    sprintf('largest = %.6f deg at %s (limit 0.05, was 0.6488)', $moonDayScan['worst'], $moonDayScan['at'])
+);
+
+// 13.6 The point of the whole fix: at the minute the response itself calls sunset, the sky is
+//      golden. The expected value is taken from the response, not hard-coded, so the assertion
+//      cannot drift away from the times we publish.
+$goldenDays = [
+    ['2026-08-17', 'the day the contract publishes'],
+    ['2026-12-21', 'winter solstice, shortest day'],
+    ['2026-06-21', 'summer solstice, longest day'],
+    ['2026-03-29', 'spring DST switch (23 h day)'],
+    ['2026-10-25', 'autumn DST switch (25 h day)'],
+];
+
+foreach ($goldenDays as [$date, $label]) {
+    $times = Sky::snapshot(new DateTimeImmutable($date . ' 12:00:00', $budapest))['times'];
+
+    foreach (['sunrise', 'sunset'] as $event) {
+        $hhmm = $times[$event];
+        if ($hhmm === null) {
+            ok("$event on $date is present ($label)", false, 'null');
+            continue;
+        }
+
+        $atEvent = Sky::snapshot(new DateTimeImmutable($date . ' ' . $hhmm . ':00', $budapest));
+        ok(
+            sprintf('%s on %s (%s) is golden', $event, $date, $hhmm),
+            $atEvent['sky']['phase'] === 'golden',
+            sprintf(
+                'phase=%s alt=%.2f blend=%.3f (%s)',
+                $atEvent['sky']['phase'],
+                $atEvent['sun']['altitude_deg'],
+                $atEvent['sky']['blend'],
+                $label
+            )
+        );
+    }
+}
+
+// And the published altitude at sunset is the ~-0.5 deg the contract now states, not -1.15.
+$sunsetTimes = Sky::snapshot(new DateTimeImmutable('2026-08-17 12:00:00', $budapest))['times'];
+$atSunset = Sky::snapshot(new DateTimeImmutable('2026-08-17 ' . $sunsetTimes['sunset'] . ':00', $budapest));
+near('published Sun altitude at sunset 2026-08-17', $atSunset['sun']['altitude_deg'], -0.5, 0.25, ' deg');
+
+// 13.7 Nothing above the horizon may have moved: the Horizons-checked sky is untouched.
+near(
+    'above the horizon refraction is unchanged (h=+10)',
+    AstroMath::refractionDeg(10.0),
+    1.02 / tan(deg2rad(10.0 + 10.3 / (10.0 + 5.11))) / 60.0 + 0.0019279 / 60.0,
+    1e-12,
+    ' deg'
+);
+
+// ---------------------------------------------------------------------------
+section('14. BUG-0009 — time zone offset validation and the ambiguous DST hour');
+// ---------------------------------------------------------------------------
+
+/*
+ * "+9999" used to reach DateTimeZone, which throws DateInvalidTimeZoneException (PHP >= 8.3).
+ * That is not an InvalidArgumentException, so api/sky.php answered 500 with an empty body.
+ * "+2400" and "+0099" were worse: accepted, and answered for a different instant.
+ */
+$invalidOffsets = [
+    '2026-08-17T20:31:00+9999' => 'offset far out of range (the 500 in the report)',
+    '2026-08-17T20:31:00-9999' => 'negative offset far out of range',
+    '2026-08-17T20:31:00+2400' => 'offset 24 h - was silently accepted as a different day',
+    '2026-08-17T20:31:00+0099' => 'minute part 99 - was silently read as +01:39',
+    '2026-08-17T20:31:00+0060' => 'minute part 60 - was silently read as +01:00',
+    '2026-08-17T20:31:00+1401' => 'one minute wider than the widest real offset',
+    '2026-08-17T20:31:00-14:01' => 'same, negative, colon form',
+    '2026-08-17T20:31:00+99:99' => 'out of range, colon form',
+];
+
+foreach ($invalidOffsets as $input => $why) {
+    throwsInvalidArgument("rejects t=$input ($why)", static function () use ($input, $budapest): void {
+        RequestTime::parse($input, $budapest);
+    });
+}
+
+$validOffsets = [
+    ['2026-08-17T20:31:00+14:00', '2026-08-17 06:31:00'],
+    ['2026-08-17T20:31:00-14:00', '2026-08-18 10:31:00'],
+    ['2026-08-17T20:31:00+1400', '2026-08-17 06:31:00'],
+    ['2026-08-17T20:31:00+05:30', '2026-08-17 15:01:00'],
+    ['2026-08-17T20:31:00-0530', '2026-08-18 02:01:00'],
+    ['2026-08-17T20:31:00+00:00', '2026-08-17 20:31:00'],
+];
+
+foreach ($validOffsets as [$input, $expectedUtc]) {
+    try {
+        $parsed = RequestTime::parse($input, $budapest)->setTimezone(new DateTimeZone('UTC'));
+        ok(
+            "accepts a real offset t=$input",
+            $parsed->format('Y-m-d H:i:s') === $expectedUtc,
+            'parsed(UTC)=' . $parsed->format('Y-m-d H:i:s') . ' expected=' . $expectedUtc
+        );
+    } catch (Throwable $e) {
+        ok("accepts a real offset t=$input", false, 'threw: ' . $e->getMessage());
+    }
+}
+
+// The parse step must never raise anything other than InvalidArgumentException - that is what
+// api/sky.php turns into a 400. Anything else is how the 500 with the empty body happened.
+$onlyInvalidArgument = true;
+$leaked = '';
+foreach (array_merge(array_keys($invalidOffsets), [
+    '2026-08-17T20:31:00+0000', '2026-08-17T20:31:00Z', '2026-02-29', '2026-08-17T20:31:00+13:59',
+    '0000-00-00', '2026-08-17T20:31:00+00:60', '1900-01-01', '2100-01-01',
+]) as $input) {
+    try {
+        RequestTime::parse($input, $budapest);
+    } catch (InvalidArgumentException) {
+        // expected shape of a client error
+    } catch (Throwable $e) {
+        $onlyInvalidArgument = false;
+        $leaked = $input . ' -> ' . $e::class;
+        break;
+    }
+}
+ok('the parser only ever throws InvalidArgumentException', $onlyInvalidArgument, $leaked === '' ? '16 inputs, no other throwable' : $leaked);
+
+// S3-2: the hour that exists twice. Documented in the contract as the SECOND (winter) reading.
+$ambiguous = RequestTime::parse('2026-10-25T02:30', $budapest);
+ok(
+    'the ambiguous autumn hour resolves to the winter (+01:00) reading',
+    $ambiguous->format('P') === '+01:00',
+    'offset=' . $ambiguous->format('P') . ' utc=' . $ambiguous->setTimezone(new DateTimeZone('UTC'))->format('H:i')
+);
+
+$firstOccurrence = RequestTime::parse('2026-10-25T02:30:00+02:00', $budapest);
+ok(
+    'the first occurrence is still reachable with an explicit offset',
+    $ambiguous->getTimestamp() - $firstOccurrence->getTimestamp() === 3600,
+    sprintf('difference = %d s (expected 3600)', $ambiguous->getTimestamp() - $firstOccurrence->getTimestamp())
+);
+
+// ---------------------------------------------------------------------------
 section('12. Performance (brief: the response must be generated under 200 ms)');
 // ---------------------------------------------------------------------------
 
