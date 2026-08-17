@@ -42,6 +42,7 @@
   var infoNoteMain = document.getElementById('info-note-main');
   var infoNoteSub = document.getElementById('info-note-sub');
   var times = document.getElementById('times');
+  var infoStrip = document.querySelector('.info');
   var bodySun = document.getElementById('body-sun');
   var bodyMoon = document.getElementById('body-moon');
   var moonLitPath = document.getElementById('moonLitPath');
@@ -405,6 +406,62 @@
 
   /* ------------------------------------------------------------- error states */
 
+  /* How tall the .info strip actually is, in px, published to the stylesheet as --info-h.
+     The error chip is positioned above it (spec 7.3/b: "az .info sav fole csuszik"), and the
+     strip's height is not a constant: it is a 2x2 grid on a phone, one row on a tablet, and it
+     grows again when the empty-state note replaces the times. The chip used to clear a
+     hard-coded 44px, which is why it sat on top of the compass labels and the info text
+     (BUG-0014). Measuring is cheap - it happens on failure and on a debounced resize, never in
+     the refresh loop - and .info's own height does not depend on the chip, so there is no
+     layout feedback loop here. */
+  function measureInfoStrip() {
+    if (!infoStrip) {
+      return;
+    }
+
+    var height = Math.round(infoStrip.getBoundingClientRect().height);
+    if (height > 0) {
+      stage.style.setProperty('--info-h', height + 'px');
+    }
+  }
+
+  /* Put the chip where it covers nothing, and check that it really does.
+     Two frames, because each step needs the previous one to have been laid out:
+       1. measure the info strip and publish --info-h (the chip's `bottom` reads it),
+       2. compare the chip's own box with the compass label band; if they meet - the landscape
+          phone leaves 58px between the labels and the info strip, and the chip needs 60 - move
+          the chip above the horizon, over the sky, where there is nothing to cover.
+     Measuring afterwards is what makes this safe for messages of any length: the "3 perce nem
+     frissult" text is twice as long as the first one, and the strip's height changes with the
+     breakpoint and the state. */
+  function placeErrorChip(chip) {
+    requestAnimationFrame(function () {
+      measureInfoStrip();
+
+      requestAnimationFrame(function () {
+        chip.classList.remove('errorchip--above-horizon');
+
+        var labels = document.querySelectorAll('.compass__label');
+        if (!labels.length) {
+          return;
+        }
+
+        var chipBox = chip.getBoundingClientRect();
+        var bandTop = Infinity;
+        var bandBottom = -Infinity;
+        for (var i = 0; i < labels.length; i++) {
+          var box = labels[i].getBoundingClientRect();
+          bandTop = Math.min(bandTop, box.top);
+          bandBottom = Math.max(bandBottom, box.bottom);
+        }
+
+        if (chipBox.bottom > bandTop && bandBottom > chipBox.top) {
+          chip.classList.add('errorchip--above-horizon');
+        }
+      });
+    });
+  }
+
   function ensureErrorChip() {
     if (errorChip) {
       return errorChip;
@@ -438,6 +495,9 @@
   }
 
   function showErrorChip() {
+    /* Measure first: the chip's `bottom` is read on the very frame it is inserted. */
+    measureInfoStrip();
+
     var chip = ensureErrorChip();
 
     chip.__text.textContent = failures >= 3
@@ -454,6 +514,8 @@
     chipTimer = window.setTimeout(function () {
       chip.classList.add('errorchip--faded');
     }, CHIP_FADE_AFTER);
+
+    placeErrorChip(chip);
   }
 
   function hideErrorChip() {
@@ -563,16 +625,22 @@
     refresh(false);
   });
 
-  window.addEventListener('resize', function () {
+  function onViewportChange() {
     window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(checkCollision, RESIZE_DEBOUNCE);
-  });
+    resizeTimer = window.setTimeout(function () {
+      checkCollision();
+      measureInfoStrip();
+      if (errorChip) {
+        /* A rotation changes both the strip's height and the room above it. */
+        placeErrorChip(errorChip);
+      }
+    }, RESIZE_DEBOUNCE);
+  }
 
-  window.addEventListener('orientationchange', function () {
-    window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(checkCollision, RESIZE_DEBOUNCE);
-  });
+  window.addEventListener('resize', onViewportChange);
+  window.addEventListener('orientationchange', onViewportChange);
 
   scheduleCollisionCheck();
+  requestAnimationFrame(measureInfoStrip);
   schedule(REFRESH_INTERVAL);
 })();

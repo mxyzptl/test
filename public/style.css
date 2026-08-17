@@ -20,6 +20,16 @@
 @property --star-f       { syntax: "<number>"; inherits: true; initial-value: 1; }
 @property --star-dim     { syntax: "<number>"; inherits: true; initial-value: 1; }
 @property --plate-alpha  { syntax: "<number>"; inherits: true; initial-value: 0.12; }
+/* --plate-boost is the accessibility surcharge (spec 10.3, "prefers-contrast: more"), and
+   --plate-alpha-eff is what actually paints the plate: base + surcharge, capped at 1.
+   They exist because a custom property must NEVER be defined in terms of itself:
+   `--plate-alpha: calc(var(--plate-alpha) + .18)` is a cycle, the declaration becomes
+   invalid at computed-value time, and the property falls back to the INHERITED value -
+   silently swallowing .hello--conflict's 0.62 as well (BUG-0013). Registering the effective
+   value as <number> also means getComputedStyle() reports a resolved number, so a test can
+   measure it instead of taking the stylesheet's word for it. */
+@property --plate-boost     { syntax: "<number>"; inherits: false; initial-value: 0; }
+@property --plate-alpha-eff { syntax: "<number>"; inherits: false; initial-value: 0.12; }
 @property --vignette-alpha { syntax: "<number>"; inherits: true; initial-value: 0.1; }
 @property --glow-a       { syntax: "<number>"; inherits: true; initial-value: 0.12; }
 @property --moon-opacity { syntax: "<number>"; inherits: true; initial-value: 1; }
@@ -566,7 +576,12 @@ body {
   padding: var(--plate-pad);
   border: 1px solid var(--c-border-glass);
   border-radius: var(--radius-plate);
-  background: rgb(var(--c-plate-rgb) / var(--plate-alpha));
+  /* The base alpha (--plate-alpha) is written by the server onto .stage and inherited here;
+     .hello--conflict and the no-JS fallback below override it. The surcharge lives in its own
+     property so that neither of them can be lost to a cycle - see the @property block. */
+  --plate-boost: 0;
+  --plate-alpha-eff: min(1, calc(var(--plate-alpha) + var(--plate-boost)));
+  background: rgb(var(--c-plate-rgb) / var(--plate-alpha-eff));
   backdrop-filter: blur(var(--plate-blur)) brightness(.78) saturate(1.12);
   -webkit-backdrop-filter: blur(var(--plate-blur)) brightness(.78) saturate(1.12);
   animation: hello-in 460ms var(--ease-out) 120ms both;
@@ -574,7 +589,7 @@ body {
               --plate-blur var(--dur-sky) linear;
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .hello { background: rgb(var(--c-plate-rgb) / calc(var(--plate-alpha) + .16)); }
+  .hello { background: rgb(var(--c-plate-rgb) / min(1, calc(var(--plate-alpha-eff) + .16))); }
 }
 @keyframes hello-in {
   from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)); }
@@ -674,12 +689,28 @@ html:not(.js) .hello { --plate-alpha: var(--nojs-alpha); }
 .refresh-dot[hidden] { display: none; }
 @keyframes pulse { from { opacity: .25; } to { opacity: .9; } }
 
-/* Refresh failure chip (spec 7.3/b). The picture stays; only this slides in above it. */
+/* Refresh failure chip (spec 7.3/b). The picture stays; only this slides in above it.
+
+   Three things here are load-bearing (BUG-0014):
+   1. left:0 + right:0 + margin-inline:auto instead of left:50% + translateX(-50%).
+      An absolutely positioned box is shrink-to-fit: with left:50% the available width is only
+      HALF the viewport, so at 375px the message broke into five ragged lines inside a 205px
+      box. Anchoring both edges gives it the full width and still centres it.
+   2. --info-h is the measured height of the .info strip (app.js writes it, and re-writes it on
+      resize). The chip sits ABOVE that strip - "az .info sav fole csuszik" - instead of above a
+      hard-coded 44px that was too small on every breakpoint, so it can no longer cover the
+      compass labels above it or the info text below it.
+   3. The entry animation must NOT use fill-mode `both`: a forwards-filling animation keeps
+      opacity:1 with animation-origin priority, which outranks .errorchip--faded forever - that
+      is why the chip never faded after 8s. Without the fill the element falls back to its own
+      declared opacity, and the fade works. */
 .errorchip {
   position: absolute;
-  left: 50%;
-  bottom: calc(var(--info-bottom) + 44px);
-  transform: translateX(-50%);
+  left: 0;
+  right: 0;
+  bottom: calc(var(--info-bottom) + var(--info-h, 44px) + var(--space-2));
+  margin-inline: auto;
+  width: fit-content;
   z-index: var(--z-info);
   display: flex;
   align-items: center;
@@ -690,13 +721,19 @@ html:not(.js) .hello { --plate-alpha: var(--nojs-alpha); }
   background: var(--c-danger-bg);
   color: var(--c-danger-text);
   font-size: var(--fs-chip);
-  animation: chip-in var(--dur-chip-in) var(--ease-out) both;
+  animation: chip-in var(--dur-chip-in) var(--ease-out);
   transition: opacity var(--dur-chip-out) var(--ease-out);
 }
+/* On a landscape phone the ground band is 112px tall and the compass labels sit in the middle
+   of it: a chip with a 44px touch target simply does not fit between the labels and the info
+   strip. When app.js measures that collision it moves the chip above the horizon line instead,
+   over the sky, where nothing is covered. CSS alone cannot decide this - it depends on how tall
+   the message turns out to be. */
+.errorchip--above-horizon { bottom: calc(100% - var(--horizon-y) + var(--space-1)); }
 .errorchip--faded { opacity: .35; }
 @keyframes chip-in {
-  from { opacity: 0; transform: translate(-50%, 8px); }
-  to   { opacity: 1; transform: translate(-50%, 0); }
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 .errorchip__text { flex: 1 1 auto; }
 .errorchip__button {
@@ -758,7 +795,11 @@ html:not(.js) .hello { --plate-alpha: var(--nojs-alpha); }
    Preferences
    -------------------------------------------------------------------------- */
 @media (prefers-contrast: more) {
-  .hello { --plate-alpha: calc(var(--plate-alpha) + .18); border-color: rgb(255 255 255 / .3); }
+  /* Spec 10.3 asks for "base + .18". It must be written as a surcharge on a SEPARATE property:
+     re-declaring --plate-alpha in terms of itself is a cycle (BUG-0013). With the surcharge the
+     collision case reaches the 0.80 the spec prescribes (white on the Sun's corona: 11.5:1),
+     and every other phase gets its +0.18 as well - measured, see tests/browser-check.mjs. */
+  .hello { --plate-boost: .18; border-color: rgb(255 255 255 / .3); }
   .compass__label { color: var(--c-text-strong); }
   .info { color: var(--c-text-strong); }
 }
