@@ -39,8 +39,19 @@ if (is_string($requested) && $requested !== '') {
     }
 }
 
+/**
+ * ?preview=error renders the calculation-failure page of design spec 7.3/a.
+ *
+ * It is here because that state is otherwise unreachable without breaking the server, and
+ * both the manual tester and the visual tester have to see it. It renders the same static
+ * night sky and the same honest message the real failure produces - it reveals nothing,
+ * changes nothing, and reaches no code the failure path does not already reach.
+ * Remove it if the PM would rather not have a test hook in production.
+ */
+$renderer = ($_GET['preview'] ?? null) === 'error' ? SkyRenderer::errorState() : null;
+
 try {
-    $renderer = SkyRenderer::fromSnapshot(
+    $renderer ??= SkyRenderer::fromSnapshot(
         Sky::snapshot($when ?? new DateTimeImmutable('now', $location->timezone()), $location)
     );
 } catch (Throwable $e) {
